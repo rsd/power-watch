@@ -2,14 +2,16 @@
 
 power-watch watches how heavily a laptop loads its power adapter and alerts
 before a sustained overload. `power-cap` lowers CPU and GPU power limits as a
-stopgap when an adapter is undersized or running hot. An optional Omarchy bar
-widget shows the load and its history. Both tools are small, stdlib-only Python
-scripts; neither ever writes to the embedded controller (EC).
+stopgap when an adapter is undersized or running hot. Both tools are small,
+stdlib-only Python scripts; neither ever writes to the embedded controller (EC).
 
 - `power-watch`: live view, one-shot JSON, headless alerting and history
   (systemd user unit).
 - `power-cap`: show, set and restore CPU (RAPL) and NVIDIA GPU power limits.
-- `omarchy-plugin/`: the optional Omarchy bar widget.
+
+An optional Omarchy bar widget, [omarchy-power-watch](https://github.com/rsd/omarchy-power-watch), lives in its own
+repository. It shows the load and its history from the files the service writes
+(see [Data contract](#data-contract-public-interface)).
 
 ## Why the number is measured or estimated
 
@@ -53,8 +55,8 @@ excludes voltage-regulator losses. Keep margin under your threshold.
 Requirements:
 
 - Linux with systemd, Python 3.10 or newer, standard library only.
-- Optional: `nvidia-smi` (NVIDIA GPU power), `notify-send` (alerts), `node` and
-  `qmllint` (some tests).
+- Optional: `nvidia-smi` (NVIDIA GPU power), `notify-send` (alerts), Omarchy
+  (the bar widget).
 
 Tested on Arch Linux with Omarchy only. Other systemd distributions are
 expected to work but are untested.
@@ -97,23 +99,38 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/power-watch.conf
 `./install.sh --user` is a separate step, run as your normal user (it refuses
 root), because `systemctl --user` needs your session bus. It:
 
-- symlinks `omarchy-plugin/` as `~/.config/omarchy/plugins/io.github.rsd.power-watch`
-  (a real directory at that path is left alone, with an error);
 - runs `systemctl --user daemon-reload`, enables the service and restarts it;
-- rescans the Omarchy shell's plugins and enables the plugin, when `omarchy` is
-  on `PATH`.
+- offers the [Omarchy bar widget](#omarchy-bar-widget) when `omarchy` is on
+  `PATH` and the widget is not installed yet. In a terminal it runs `omarchy
+  plugin add https://github.com/rsd/omarchy-power-watch --enable`, which asks you to confirm the
+  plugin; otherwise it prints that command, as it does when you decline or the
+  add fails (not an error). An installed widget is left alone: one in
+  `~/.config/omarchy/plugins/io.github.rsd.power-watch`, or one `omarchy plugin
+  list` reports from another plugin dir. `POWER_WATCH_INTERACTIVE=0` skips the
+  offer, `=1` makes it without a terminal check;
+- removes the `~/.config/omarchy/plugins/io.github.rsd.power-watch` link into
+  this checkout's `omarchy-plugin/` that older versions created (by either path
+  to the checkout, or any dangling link to an `.../omarchy-plugin`), since the
+  widget moved to its own repository. It tries `omarchy plugin disable` first
+  (which usually fails once the target is gone or no shell runs: reported, not
+  an error) and afterwards `omarchy-shell shell rescanPlugins`, so a running
+  shell drops the entry.
 
-Each failed step prints a warning with the command to retry, and the exit code
-is non-zero. Without Omarchy you still get the service. To pass one-off flags
+Each failed service step prints a warning with the command to retry, and the
+exit code is non-zero. Without Omarchy you still get the service. To pass one-off flags
 to the service, run `systemctl --user edit power-watch` and override
 `ExecStart`.
 
 ### Uninstall
 
 ```
-./install.sh --user --uninstall    # as your user: disable plugin and service, remove the link
+./install.sh --user --uninstall    # as your user: disable the service
 sudo ./install.sh --uninstall      # remove the installed files
 ```
+
+The user uninstall leaves the bar widget alone (it prints `omarchy plugin
+remove io.github.rsd.power-watch` when the widget is installed), except for the
+old link into `omarchy-plugin/`, which it removes as `--user` does.
 
 The system uninstall removes the binaries, the unit, the tmpfiles rule and the
 example config. It leaves your config alone, and the `energy_uj` read access
@@ -198,49 +215,16 @@ latest on-battery data wins. Calibrate under typical load and brightness.
 Lower-bound alerts say so. With `--quiet`, an unreadable RAPL sends its own
 notification.
 
-### JSON fields
+### JSON output and history
 
-`--once --json` and `current.json` carry these keys. Unknown values are `null`.
+`--once --json` prints one object with the keys of `current.json`, without its
+four service-only keys. Only `power-watch --quiet` records `current.json` and
+the history tiers. Keys, files and formats are in
+[Data contract](#data-contract-public-interface). The CSV `--log` columns are a
+frozen schema, unchanged by the newer JSON keys.
 
-| Key | Meaning |
-|---|---|
-| `time`, `ac_online`, `battery_status`, `battery_capacity`, `battery_w` | Time, AC state and battery state |
-| `cpu_w`, `gpu_w`, `rest_w`, `rest_source`, `charge_w` | Terms of the estimate |
-| `gpu_limit_w`, `gpu_pstate` | GPU power limit and P-state (NVIDIA) |
-| `total_w`, `total_kind` | Total, `measured` or `estimated` |
-| `total_source` | `battery`, `psys` or `model` |
-| `total_lower_bound` | `true` when an estimate has unknown terms (counted as 0) |
-| `psys_w` | RAPL `psys` platform power, or `null` |
-| `gpu_status` | `active`, `suspended`, `none`, `disabled` or `unknown` |
-| `gpu_devices` | List of `{pci, vendor, status, power_w}` |
-| `incomplete` | Some term the total depends on is unknown |
-| `adapter_v`, `adapter_current_a`, `adapter_rating_w` | `null` when voltage or rating is unknown |
-| `threshold_w`, `errors` | Resolved threshold and read errors |
-
-`current.json` adds `interval_s`, `cpu_limit_w`, `gpu_max_limit_w` and `epoch`.
-The CSV `--log` columns are a frozen schema, unchanged by the newer JSON keys.
-
-### History
-
-Only `power-watch --quiet` records history. Files live in the state dir
-(`$POWER_WATCH_STATE_DIR`, else `$XDG_STATE_HOME/power-watch`, else
-`~/.local/state/power-watch`):
-
-| File | Holds | Kept |
-|---|---|---|
-| `history-raw.jsonl` | every sample | 1 h |
-| `history-1m.jsonl` | 60 s buckets | 48 h |
-| `history-15m.jsonl` | 900 s buckets | 14 d |
-| `current.json` | the latest sample, rewritten atomically | latest only |
-
-Each history line holds `t` (bucket start, Unix seconds), `n` (samples), `avg`
-and `max` of the total, mean `cpu`, `gpu`, `rest`, `chg`, `ac` (fraction of
-samples on AC) and `k` (`m` measured, `e` estimated, `x` mixed). Points more
-than 2.5 steps apart are a gap; readers break the line and never interpolate.
-Files are size-bounded and compacted automatically, and a `flock` keeps a
-second `--quiet` instance from writing. `power-watch history` prints Max,
-Average and Current; `--json` prints `{range, tier, step_s, from, to, points,
-stats, threshold_w}`.
+`power-watch history` prints Max, Average and Current; `--json` prints
+`{range, tier, step_s, from, to, points, stats, threshold_w}`.
 
 ### power-cap
 
@@ -263,41 +247,138 @@ sudo power-cap reset
 - After a reset, `/run/power-cap` stays root-only, so unprivileged
   `power-cap status` says "Cap: unknown" until reboot. Use sudo.
 
+## Data contract (public interface)
+
+The state dir, `current.json` and the `history-*.jsonl` tiers that `power-watch
+--quiet` (the user service) writes are power-watch's public interface. The
+[omarchy-power-watch](https://github.com/rsd/omarchy-power-watch) bar widget reads them, and so may
+any other consumer. Readers never write to the state dir.
+
+### State dir
+
+First hit wins:
+
+1. `$POWER_WATCH_STATE_DIR`, as is
+2. `$XDG_STATE_HOME/power-watch`
+3. `~/.local/state/power-watch`
+
+An empty variable counts as unset. Trailing slashes are dropped (`/` stays `/`).
+Nothing is trimmed: a leading space is part of the path. A consumer resolves
+the dir in its own environment (the widget in the Omarchy shell's), so set a
+variable for both or for neither.
+
+The dir holds `current.json`, `history-raw.jsonl`, `history-1m.jsonl` and
+`history-15m.jsonl`. `history.lock` (the writer's `flock`) and
+`calibration.json` are internal and not part of the contract.
+
+### current.json
+
+The latest sample: the `--once --json` report plus `interval_s`,
+`cpu_limit_w`, `gpu_max_limit_w` and `epoch`. After every sample it is written
+complete to a temporary file in the same dir and renamed over the old one
+(`os.replace`), so a reader sees the old file or the new one, never a partial
+one, and a directory watch sees every update. It is a few hundred bytes; the
+widget does not read one over 16 KiB. A sample whose `epoch` is older than 3 x
+`interval_s` means the service is not running.
+
+Numbers are JSON numbers (never strings). Measured and estimated watts and
+amps are rounded to 2 decimals and `battery_capacity` is a whole percent;
+`epoch` is not rounded (fractional seconds), and `cpu_limit_w` and the
+configured `adapter_v`, `adapter_rating_w` and `threshold_w` are written as
+read or configured. `null` means unknown or not applicable, as listed.
+
+| Key | Type | Meaning, unit | `null` when |
+|---|---|---|---|
+| `time` | string | local time of the sample, ISO 8601 with offset | never |
+| `epoch` | number | Unix time of the sample, s | never |
+| `interval_s` | number | sampling interval, s | never |
+| `ac_online` | boolean | adapter plugged in | AC state unreadable |
+| `battery_status` | string | kernel battery status (`Charging`, `Discharging`, `Not charging`, ...) | no battery or unreadable |
+| `battery_capacity` | number | battery charge, % | unreadable |
+| `battery_w` | number | battery power, W | unreadable |
+| `cpu_w` | number | CPU package power (RAPL), W | RAPL unreadable |
+| `gpu_w` | number | discrete GPUs summed, W (0 when none, disabled or suspended) | a GPU's power unreadable |
+| `gpu_limit_w`, `gpu_max_limit_w` | number | NVIDIA enforced and maximum power limit, W | no active NVIDIA GPU read |
+| `gpu_pstate` | string | NVIDIA P-state (`P0` ... `P12`) | no active NVIDIA GPU read |
+| `gpu_status` | string | `active`, `suspended`, `none`, `disabled` or `unknown` | never |
+| `gpu_devices` | array | one `{pci, vendor, status, power_w}` per discrete GPU: `pci` like `0000:01:00.0`, `vendor` `nvidia` or `amd`, `status` `active`, `suspended` or `unknown`, `power_w` W or `null` | never (empty list) |
+| `rest_w` | number | rest of system, W | never |
+| `rest_source` | string | `default`, `calibrate` or `passive` | never |
+| `charge_w` | number | battery charge power counted on AC, W (0 when not charging or unreadable) | never |
+| `total_w` | number | the adapter load, W | on battery with the discharge unreadable |
+| `total_kind` | string | `measured` or `estimated` | never |
+| `total_source` | string | `battery`, `psys` or `model` | never |
+| `total_lower_bound` | boolean | an estimate with an unknown term counted as 0 | never |
+| `incomplete` | boolean | a term the total depends on is unknown | never |
+| `psys_w` | number | RAPL `psys` platform power, W | no `psys`, or `--no-psys` |
+| `adapter_v`, `adapter_rating_w` | number | configured adapter voltage (V) and rating (W) | not configured |
+| `adapter_current_a` | number | adapter current, A | voltage not configured, or on battery |
+| `threshold_w` | number | resolved alert threshold, W | never |
+| `cpu_limit_w` | number | CPU long-term limit (PL1), W | unreadable |
+| `errors` | array | read errors of this sample, strings | never (empty list) |
+
+The widget reads every key except `time`. It treats a value outside the listed
+values or types as not reported.
+
+### History tiers
+
+| File | One line per | Kept |
+|---|---|---|
+| `history-raw.jsonl` | sample | 1 h |
+| `history-1m.jsonl` | 60 s bucket | 48 h |
+| `history-15m.jsonl` | 900 s bucket | 14 d |
+
+Each line is one JSON object, ASCII and well under 1024 characters (the widget
+skips a longer line); the widget reads all of these fields, the 1h,
+24h and 7d ranges from the raw, 1m and 15m tier:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `t` | number | bucket start, Unix s (raw: the sample's `epoch` rounded to 2 decimals) |
+| `n` | integer | samples in the bucket (raw: 1) |
+| `avg`, `max` | number or `null` | mean and maximum `total_w`, W |
+| `cpu`, `gpu`, `rest`, `chg` | number or `null` | mean `cpu_w`, `gpu_w`, `rest_w`, `charge_w`, W |
+| `ac` | number or `null` | fraction of samples on AC, 0 to 1 |
+| `k` | string | `m` all measured, `e` all estimated, `x` mixed |
+
+Values are rounded to 2 decimals, and a mean is `null` when no sample in the
+bucket had that value. Lines are appended in increasing `t`, a bucket's line
+when the bucket closes; on a clean stop the open buckets are appended too. A
+line is never written with a `t` at or before the last one. At start and when
+a file grows past 1.25 x its retention, it is compacted: rewritten to a
+temporary file, fsynced and renamed over the original, keeping the lines
+inside the retention. A crash can leave a torn last line, so readers skip
+lines that do not parse. Points more than 2.5 steps apart are a gap: readers
+break the line and never interpolate. A `flock` on `history.lock` keeps a
+second `--quiet` instance from writing.
+
+### Stability
+
+Additive changes are compatible: a new key in `current.json`, a new field in a
+history line, a new file in the state dir, a longer retention. Consumers ignore
+what they do not know. Renaming or removing a key, field or file, changing a
+JSON type or an enumerated value, changing the state dir resolution, giving up
+the atomic rename of `current.json`, or keeping a tier for less than the range
+the widget shows from it, is a breaking change for the widget.
+`tests/test_contract.py` pins all of this against the real service.
+
 ## Omarchy bar widget
 
-`omarchy-plugin/` is an Omarchy shell plugin, id `io.github.rsd.power-watch`
-(MIT, with its own `LICENSE`). Install it with `./install.sh --user`; it needs
-the service running.
+The bar widget is a separate Omarchy shell plugin,
+[rsd/omarchy-power-watch](https://github.com/rsd/omarchy-power-watch) (id `io.github.rsd.power-watch`). It
+shows the load in the bar, coloured as it nears the threshold, and a panel
+with the 1h, 24h and 7d history. Add it with:
 
-- **Bar.** Shows the load in watts, coloured as normal, approaching (from 85 % of
-  the threshold) or over. A lower bound is marked "≥". Measured platform power
-  and a suspended GPU are labelled. The adapter amps and share of rating show
-  "Not configured" when voltage or rating is not set in the config.
-- **Panel** (click the widget). Charts for 1h, 24h and 7d: average, max, CPU and
-  GPU, the threshold, and a band for the source (battery measured, AC measured
-  or estimated, mixed). Below that: Max, Average, Current, the current breakdown
-  and the power caps. Keys: left/right change range, Esc closes.
-- **Staleness.** The number goes stale, and the widget is dimmed with a hint,
-  after 3 x max(`interval_s`, 1 s) without a new sample.
-- **What it reads.** Only `current.json` and the `history-*.jsonl` files in the
-  state dir, size-gated (16 KiB and 16 MiB). It never reads the config. It has no
-  network access, writes nothing and spawns no processes. The service start
-  command it shows when stale is display text only and is never executed. It
-  finds the state dir like the service does (`POWER_WATCH_STATE_DIR`, else
-  `XDG_STATE_HOME`), as seen by the shell process, so set the variable in both or
-  neither.
-- **Removal.** `./install.sh --user --uninstall`, or by hand: `omarchy plugin
-  disable io.github.rsd.power-watch`, remove the symlink in
-  `~/.config/omarchy/plugins/`, and run `omarchy-shell shell rescanPlugins`.
-  Nothing needs to be stopped first.
+```
+omarchy plugin add https://github.com/rsd/omarchy-power-watch --enable
+```
 
-Move the widget with `omarchy bar move io.github.rsd.power-watch --section
-right` (see `omarchy bar --help`). The shell caches QML: after editing plugin
-code, run `omarchy restart shell`.
-
-**Known limitation.** The plugin lives in `omarchy-plugin/` of this repository.
-A marketplace submission would need the plugin at a repository root, which this
-layout does not provide.
+It needs the service running (`./install.sh --user`, which offers that command
+when run in a terminal). It reads only the files in
+[Data contract](#data-contract-public-interface). Update it with `omarchy
+plugin update io.github.rsd.power-watch` and remove it with `omarchy plugin
+remove io.github.rsd.power-watch`. Its documentation and tests live in its
+repository.
 
 ## Limitations
 
@@ -320,9 +401,8 @@ layout does not provide.
 python3 -m pytest -q tests/
 ```
 
-Needs only the standard library and pytest. `tests/plugin/model-test.js` (the
-plugin's model logic) needs `node`, and its pytest wrapper skips without it; the
-QML lint test skips without `qmllint`. Fixtures are injected through
+Needs only the standard library and pytest. `tests/test_contract.py` guards
+the [Data contract](#data-contract-public-interface) the bar widget reads. Fixtures are injected through
 `POWER_WATCH_SYSFS`, `POWER_WATCH_NVIDIA_SMI`, `POWER_WATCH_STATE_DIR`,
 `POWER_WATCH_NOTIFY` and `POWER_CAP_STATE_DIR`, so no root and no GPU are needed.
 
@@ -347,21 +427,18 @@ Compare each expectation with your own machine's specs.
 6. Alert test: `power-watch --threshold 50 --sustain 4` under load, on AC. Expect
    one critical notification, not repeated within `--alert-every`.
 7. `sudo power-cap reset`. Expect your original limits back and "Cap: none".
-8. `./install.sh --user`. Expect the plugin linked and enabled with no warnings,
-   and `systemctl --user status power-watch` active.
+8. `./install.sh --user` in a terminal. Expect `systemctl --user status
+   power-watch` active, no warnings, and with Omarchy the offer to add the bar
+   widget (omarchy asks you to confirm). Run it again: the widget is reported
+   as already installed and nothing is added.
    - Reboot and check whether `energy_uj` kept its mode. If not, re-apply the
      tmpfiles rule (see Install).
-   - The bar shows watts within a few seconds. Stop the service: it dims within
-     about 10 s plus 3 x interval. Start it: watts return.
-   - Open the panel and switch 1h / 24h / 7d. `power-watch history --json`
-     should agree with Max, Average and Current.
-   - Unplug the adapter for a minute and replug: the chart shows a battery band.
-     Stop the service for a minute: a gap appears.
-   - Set a low `--threshold` via `systemctl --user edit power-watch` under load:
-     expect the normal, approaching and over colours.
-   - `./install.sh --user --uninstall`: the widget disappears and the service
-     stops.
+   - `ls ~/.local/state/power-watch`: `current.json` and the three
+     `history-*.jsonl` files. `power-watch history --json` shows points.
+   - `./install.sh --user --uninstall`: the service stops; the widget stays,
+     with the `omarchy plugin remove` hint. The widget's own checks live in its
+     repository.
 
 ## License
 
-MIT. See `LICENSE`; the plugin carries its own MIT `LICENSE` in `omarchy-plugin/`.
+MIT. See `LICENSE`.

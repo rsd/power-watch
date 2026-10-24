@@ -4,9 +4,11 @@
 #   sudo ./install.sh              install and apply the tmpfiles rule now
 #   sudo ./install.sh --group NAME   same, granting the RAPL read access to group NAME
 #   sudo ./install.sh --uninstall  remove the installed files
-#   ./install.sh --user            as your user: link the Omarchy bar plugin, enable and
-#                                  (re)start the power-watch user service, enable the plugin
-#   ./install.sh --user --uninstall  disable the plugin and the service, remove the link
+#   ./install.sh --user            as your user: enable and (re)start the power-watch user
+#                                  service, then offer the Omarchy bar widget, a separate
+#                                  plugin (github.com/rsd/omarchy-power-watch), when omarchy
+#                                  is present and stdin/stdout are a terminal
+#   ./install.sh --user --uninstall  disable the service (a separately installed plugin is left)
 #
 # --user is a separate step run as the normal user (it refuses root) because
 # `systemctl --user` needs the user's session bus, which a root/sudo context does not have.
@@ -34,10 +36,14 @@
 #   RAPL_GROUP        group for the tmpfiles rule (--group wins over it; empty = unset)
 #   GETENT            getent command used to check groups (default getent)
 # --user only:
-#   OMARCHY_PLUGIN_DIR  Omarchy shell plugin dir (default ~/.config/omarchy/plugins)
+#   OMARCHY_PLUGIN_DIR  Omarchy shell plugin dir, to see whether the bar widget is installed
+#                       (default ~/.config/omarchy/plugins, where `omarchy plugin add` puts it)
 #   SYSTEMCTL           systemctl command (default systemctl)
 #   OMARCHY             omarchy command (default omarchy; skipped if not on PATH)
-#   OMARCHY_SHELL       omarchy-shell command, for `shell rescanPlugins` (default omarchy-shell)
+#   OMARCHY_SHELL       omarchy-shell command, for `shell rescanPlugins` after the old bundled
+#                       plugin link is removed (default omarchy-shell; skipped if not on PATH)
+#   POWER_WATCH_INTERACTIVE  1 or 0: whether to run `omarchy plugin add` (it asks you to
+#                       confirm), overriding the check that stdin and stdout are a terminal
 set -eu
 
 PREFIX=${PREFIX:-/usr/local}
@@ -105,9 +111,14 @@ if [ -n "$user_mode" ]; then
     OMARCHY_SHELL=${OMARCHY_SHELL:-omarchy-shell}
     plugin_id=io.github.rsd.power-watch
     plugin_id_re='io\.github\.rsd\.power-watch'
+    plugin_url=https://github.com/rsd/omarchy-power-watch
+    plugin_add="omarchy plugin add $plugin_url --enable"
     plugin_dir=${OMARCHY_PLUGIN_DIR:-$HOME/.config/omarchy/plugins}
-    link=$plugin_dir/$plugin_id
-    target=$src/omarchy-plugin
+    plugin_path=$plugin_dir/$plugin_id
+    # where install.sh used to link the plugin from, before it moved to its own repo; the
+    # checkout may have been reached by another path then (a symlinked dir), hence both
+    legacy_target=$src/omarchy-plugin
+    legacy_target_phys=$(cd "$src" && pwd -P)/omarchy-plugin
     unit_name=power-watch.service
 
     if [ "$(id -u)" -eq 0 ]; then
@@ -126,62 +137,59 @@ if [ -n "$user_mode" ]; then
     have_omarchy() {
         command -v "$OMARCHY" >/dev/null 2>&1
     }
-    # The running shell only sees a new plugin dir after a rescan (omarchy-plugin-clone and
-    # omarchy-plugin-remove do the same); fails when the shell is not running.
-    rescan_plugins() {
-        "$OMARCHY_SHELL" shell rescanPlugins >/dev/null 2>&1
+    # stdin and stdout on a terminal: omarchy's own trust prompt can ask
+    interactive() {
+        case ${POWER_WATCH_INTERACTIVE:-} in
+            1) return 0 ;;
+            0) return 1 ;;
+        esac
+        [ -t 0 ] && [ -t 1 ]
     }
-    plugin_discovered() {
+    # The link the old installer made: into this checkout by either path, or dangling into
+    # some .../omarchy-plugin (the dir is gone once the checkout is past the repo split).
+    plugin_is_legacy_link() {
+        [ -L "$plugin_path" ] || return 1
+        link_target=$(readlink "$plugin_path")
+        case $link_target in
+            "$legacy_target"|"$legacy_target_phys") return 0 ;;
+            */omarchy-plugin) [ ! -e "$plugin_path" ] ;;
+            *) return 1 ;;
+        esac
+    }
+    # `omarchy plugin list --json`, whitespace tolerated, names the plugin (in any plugin dir)
+    plugin_listed() {
         "$OMARCHY" plugin list --json 2>/dev/null |
             grep -Eq "\"id\"[[:space:]]*:[[:space:]]*\"$plugin_id_re\""
     }
-    # like omarchy-plugin-clone: rescan, then wait up to 2 s (40 x 50 ms) for discovery
-    wait_for_discovery() {
-        attempt=0
-        while [ "$attempt" -lt 40 ]; do
-            plugin_discovered && return 0
-            sleep 0.05
-            attempt=$((attempt + 1))
-        done
-        return 1
+    # Disable the old bundled plugin, drop the link, then have a running shell rescan so no
+    # stale entry is left. Disabling needs a shell that still knows the plugin, so it fails in
+    # the usual upgrade (target gone, or no shell running): information, not an error.
+    remove_legacy_link() {
+        plugin_is_legacy_link || return 0
+        if have_omarchy && ! "$OMARCHY" plugin disable "$plugin_id"; then
+            echo "Could not disable the old bundled plugin (no shell running, or it is already" \
+                 "gone); removing its link anyway."
+        fi
+        rm -f "$plugin_path"
+        echo "Removed the old bundled plugin link $plugin_path -> $link_target"
+        if command -v "$OMARCHY_SHELL" >/dev/null 2>&1 &&
+            ! "$OMARCHY_SHELL" shell rescanPlugins >/dev/null 2>&1; then
+            echo "Omarchy shell not reachable; it drops the old plugin when it next starts."
+        fi
     }
 
+    remove_legacy_link
     if [ "$mode" = uninstall ]; then
-        if have_omarchy; then
-            "$OMARCHY" plugin disable "$plugin_id" ||
-                warn "disabling the Omarchy plugin failed" "omarchy plugin disable $plugin_id"
-        else
-            echo "omarchy not found; if the bar widget is enabled, run: omarchy plugin disable $plugin_id"
-        fi
         "$SYSTEMCTL" --user disable --now "$unit_name" ||
             warn "disabling the service failed" "systemctl --user disable --now $unit_name"
-        if [ -L "$link" ]; then
-            rm -f "$link"
-            echo "Removed $link"
-            # a shell that is not running finds no plugin dir when it starts: nothing to do
-            rescan_plugins ||
-                echo "Omarchy shell not reachable; it drops the plugin when it next starts."
-        elif [ -e "$link" ]; then
-            echo "install.sh: $link is not a symlink; left in place" >&2
+        # a separately installed plugin is omarchy's to manage
+        if [ -e "$plugin_path" ] || [ -L "$plugin_path" ]; then
+            echo "The Omarchy bar widget is installed separately; to remove it run:" \
+                 "omarchy plugin remove $plugin_id"
         fi
         exit "$status"
     fi
 
-    linked=
-    if [ ! -d "$target" ]; then
-        warn "$target is missing, Omarchy plugin not linked" \
-             "./install.sh --user from a complete power-watch checkout"
-    elif [ -L "$link" ] || [ ! -e "$link" ]; then
-        if mkdir -p "$plugin_dir" && ln -sfn "$target" "$link"; then
-            echo "Linked $link -> $target"
-            linked=1
-        else
-            warn "linking the Omarchy plugin failed" "ln -sfn $target $link"
-        fi
-    else
-        warn "$link exists and is not a symlink; refusing to replace it" \
-             "move it away, then ./install.sh --user"
-    fi
     "$SYSTEMCTL" --user daemon-reload ||
         warn "systemctl --user daemon-reload failed" "systemctl --user daemon-reload"
     if "$SYSTEMCTL" --user enable "$unit_name"; then
@@ -192,19 +200,24 @@ if [ -n "$user_mode" ]; then
         warn "enabling the service failed (did \`sudo ./install.sh\` run first?)" \
              "systemctl --user enable $unit_name && systemctl --user restart $unit_name"
     fi
-    if [ -z "$linked" ]; then
-        echo "Omarchy plugin not linked; not enabling it."
+
+    # The bar widget is a separate Omarchy plugin: offered, never installed behind your back.
+    if [ -e "$plugin_path" ]; then
+        echo "Omarchy bar widget already installed ($plugin_path)."
+    elif have_omarchy && plugin_listed; then
+        # omarchy refuses an id it already finds in another plugin dir
+        echo "Omarchy bar widget already installed (omarchy plugin list reports $plugin_id)."
+    elif [ -L "$plugin_path" ]; then
+        warn "$plugin_path is a dangling symlink; Omarchy bar widget not added" \
+             "rm $plugin_path && $plugin_add"
     elif ! have_omarchy; then
-        echo "omarchy not found; to add the bar widget run: omarchy plugin enable $plugin_id"
-    elif ! rescan_plugins; then
-        warn "the Omarchy shell did not rescan its plugins (is it running?); bar widget not enabled" \
-             "omarchy-shell shell rescanPlugins && omarchy plugin enable $plugin_id"
-    elif ! wait_for_discovery; then
-        warn "the Omarchy shell has not discovered $plugin_id after 2 s; bar widget not enabled" \
-             "omarchy plugin enable $plugin_id"
+        echo "omarchy not found; for the Omarchy bar widget run: $plugin_add"
+    elif ! interactive; then
+        echo "Omarchy bar widget not added (no terminal to confirm); to add it run: $plugin_add"
     else
-        "$OMARCHY" plugin enable "$plugin_id" ||
-            warn "enabling the Omarchy plugin failed" "omarchy plugin enable $plugin_id"
+        # non-zero also when you decline omarchy's own prompt ("aborted"): not an error here
+        "$OMARCHY" plugin add "$plugin_url" --enable ||
+            echo "Omarchy bar widget not added; to add it later run: $plugin_add"
     fi
     exit "$status"
 fi
@@ -302,7 +315,7 @@ Next steps (as your user, not root):
   mkdir -p ~/.config/power-watch
   cp $PREFIX/share/power-watch/config.example ~/.config/power-watch/config
                               optional: set your adapter's voltage and rating there
-  ./install.sh --user         start the background service (alerts, history) and add the Omarchy bar widget
+  ./install.sh --user         start the background service (alerts, history); offers the Omarchy bar widget
   power-watch                 check the live estimate
   power-watch calibrate       measure the rest-of-system baseline
   power-cap status            show current CPU/GPU limits

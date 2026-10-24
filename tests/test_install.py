@@ -2,10 +2,10 @@
 
 import fnmatch
 import os
+import pty
 import shutil
 import stat
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -305,17 +305,20 @@ def test_live_install_requires_root(setup):
 # ------------------------------------------------------------- --user mode
 
 PLUGIN_ID = "io.github.rsd.power-watch"
-SYSTEMCTL_INSTALL = ["--user daemon-reload", "--user enable power-watch.service",
-                     "--user restart power-watch.service"]
-# one log for omarchy and omarchy-shell ("shell ..."), so their relative order is checked;
-# the shell stub notes whether the plugin link existed when it rescanned
-RESCAN_LINKED = "shell shell rescanPlugins [linked]"
-RESCAN_UNLINKED = "shell shell rescanPlugins [unlinked]"
-OMARCHY_ENABLE = [RESCAN_LINKED, "plugin list --json", f"plugin enable {PLUGIN_ID}"]
+PLUGIN_URL = "https://github.com/rsd/omarchy-power-watch"
+PLUGIN_ADD = f"omarchy plugin add {PLUGIN_URL} --enable"
+PLUGIN_DISABLE = f"omarchy plugin disable {PLUGIN_ID}"
+PLUGIN_LIST = "omarchy plugin list --json"
+RESCAN = "omarchy-shell shell rescanPlugins"
+# systemctl, omarchy and omarchy-shell log to one file ("<name> <args>"), so their relative order is checked
+SYSTEMCTL_INSTALL = ["systemctl --user daemon-reload",
+                     "systemctl --user enable power-watch.service",
+                     "systemctl --user restart power-watch.service"]
+SYSTEMCTL_UNINSTALL = ["systemctl --user disable --now power-watch.service"]
 
 
-def recorder(path, log, rc=0):
-    path.write_text(f'#!/bin/sh\necho "$*" >> "{log}"\nexit {rc}\n')
+def recorder(path, log, name, rc=0):
+    path.write_text(f'#!/bin/sh\necho "{name} $*" >> "{log}"\nexit {rc}\n')
     path.chmod(0o755)
     return str(path)
 
@@ -324,223 +327,351 @@ def calls(log):
     return log.read_text().splitlines() if log.exists() else []
 
 
-def omarchy_stub(path, log, rc=0, discover_after=1):
-    """omarchy: logs each call; `plugin list --json` shows the plugin only after a rescan, from
-    the `discover_after`-th listing on (the shell discovers it asynchronously); every other
-    command exits `rc`."""
-    lists = f"{log}.lists"
-    path.write_text(f"""#!/bin/sh
-echo "$*" >> "{log}"
-if [ "$1 $2" = "plugin list" ]; then
-    ids='{{"id":"omarchy.clock"}}'
-    if [ -e "{log}.rescanned" ]; then
-        n=$(($(cat "{lists}" 2>/dev/null || echo 0) + 1))
-        echo "$n" > "{lists}"
-        [ "$n" -ge {discover_after} ] && ids="$ids"',{{"id": "{PLUGIN_ID}"}}'
-    fi
-    echo "[$ids]"
-    exit 0
-fi
-exit {rc}
-""")
-    path.chmod(0o755)
-    return str(path)
-
-
-def shell_stub(path, log, link, rc=0):
-    """omarchy-shell: logs "shell <args> [linked|unlinked]"; rc != 0 = shell not running."""
-    path.write_text(f"""#!/bin/sh
-if [ -L "{link}" ]; then state=linked; else state=unlinked; fi
-echo "shell $* [$state]" >> "{log}"
-[ {rc} -eq 0 ] || exit {rc}
-touch "{log}.rescanned"
-""")
-    path.chmod(0o755)
-    return str(path)
-
-
 @pytest.fixture
 def user_setup(setup, tmp_path):
-    """--user env: recorders for systemctl and omarchy, plugin dir and HOME in tmp."""
+    """--user env: recorders for systemctl, omarchy and omarchy-shell, plugin dir and HOME in
+    tmp, and an interactive session (POWER_WATCH_INTERACTIVE=1) unless a test says otherwise."""
     src, _, _, env = setup
-    plugin_src = src / "omarchy-plugin"
-    if (REPO / "omarchy-plugin").is_dir():
-        shutil.copytree(REPO / "omarchy-plugin", plugin_src)
-    else:
-        plugin_src.mkdir()
-        (plugin_src / "manifest.json").write_text("{}\n")
     env = {k: v for k, v in env.items() if k not in ("DESTDIR", "SYSTEMD_TMPFILES")}
-    logs = {"systemctl": tmp_path / "systemctl-calls", "omarchy": tmp_path / "omarchy-calls"}
-    link = tmp_path / "plugins" / PLUGIN_ID
+    log = tmp_path / "calls"
+    plugin = tmp_path / "plugins" / PLUGIN_ID
     env.update(HOME=str(tmp_path / "home"), OMARCHY_PLUGIN_DIR=str(tmp_path / "plugins"),
-               SYSTEMCTL=recorder(tmp_path / "systemctl", logs["systemctl"]),
-               OMARCHY=omarchy_stub(tmp_path / "omarchy", logs["omarchy"]),
-               OMARCHY_SHELL=shell_stub(tmp_path / "omarchy-shell", logs["omarchy"], link))
-    return src, env, logs, link
+               SYSTEMCTL=recorder(tmp_path / "systemctl", log, "systemctl"),
+               OMARCHY=recorder(tmp_path / "omarchy", log, "omarchy"),
+               OMARCHY_SHELL=recorder(tmp_path / "omarchy-shell", log, "omarchy-shell"),
+               POWER_WATCH_INTERACTIVE="1")
+    return src, env, log, plugin
 
 
-def test_user_install_links_plugin_enables_and_restarts(user_setup):
-    src, env, logs, link = user_setup
+def lister(path, log, listing):
+    """omarchy stub: records every call like recorder; `plugin list --json` prints `listing`."""
+    out = path.with_name(path.name + ".json")
+    out.write_text(listing)
+    path.write_text(f'#!/bin/sh\necho "omarchy $*" >> "{log}"\n'
+                    f'[ "$1 $2 $3" = "plugin list --json" ] && cat "{out}"\nexit 0\n')
+    path.chmod(0o755)
+    return str(path)
+
+
+def legacy_link(src, plugin, target_exists, checkout=None):
+    """The link the old installer made: <plugin dir>/<id> -> <checkout>/omarchy-plugin (the
+    checkout as `src`, or as another path to it)."""
+    target = (checkout or src) / "omarchy-plugin"
+    if target_exists:
+        target.mkdir()
+        (target / "manifest.json").write_text("{}\n")
+    plugin.parent.mkdir(parents=True, exist_ok=True)
+    plugin.symlink_to(target)
+    return target
+
+
+def test_user_install_enables_service_then_offers_plugin(user_setup):
+    src, env, log, plugin = user_setup
     r = install(src, env, "--user")
     assert r.returncode == 0, r.stderr
-    assert link.is_symlink() and Path(os.readlink(link)) == src / "omarchy-plugin"
-    assert calls(logs["systemctl"]) == SYSTEMCTL_INSTALL
-    assert calls(logs["omarchy"]) == OMARCHY_ENABLE  # rescan, discovered, then enable
+    assert calls(log) == SYSTEMCTL_INSTALL + [PLUGIN_LIST, PLUGIN_ADD]  # no --yes: omarchy asks
+    assert not plugin.exists() and not plugin.is_symlink()  # install.sh links nothing itself
+    assert not plugin.parent.exists()
 
 
-def test_user_install_waits_for_discovery_before_enabling(user_setup, tmp_path):
-    src, env, logs, _ = user_setup
-    env["OMARCHY"] = omarchy_stub(tmp_path / "omarchy-slow", logs["omarchy"], discover_after=3)
+def test_user_install_non_interactive_prints_the_add_command(user_setup):
+    src, env, log, _ = user_setup
+    r = install(src, {**env, "POWER_WATCH_INTERACTIVE": "0"}, "--user")
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == SYSTEMCTL_INSTALL + [PLUGIN_LIST]
+    assert f"to add it run: {PLUGIN_ADD}" in r.stdout
+
+
+def test_user_install_detects_no_terminal(user_setup):
+    src, env, log, _ = user_setup
+    env.pop("POWER_WATCH_INTERACTIVE")
+    r = install(src, env, "--user")  # captured stdout is not a terminal
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == SYSTEMCTL_INSTALL + [PLUGIN_LIST]
+    assert PLUGIN_ADD in r.stdout
+
+
+def test_user_install_detects_a_terminal(user_setup):
+    src, env, log, _ = user_setup
+    env.pop("POWER_WATCH_INTERACTIVE")
+    leader, follower = pty.openpty()
+    try:
+        r = subprocess.run(["bash", str(src / "install.sh"), "--user"], stdin=follower,
+                           stdout=follower, stderr=subprocess.PIPE, text=True, env=env,
+                           check=False, timeout=30)
+    finally:
+        os.close(follower)
+        os.close(leader)
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == SYSTEMCTL_INSTALL + [PLUGIN_LIST, PLUGIN_ADD]
+
+
+def test_user_install_without_omarchy_prints_the_add_command(user_setup, tmp_path):
+    src, env, log, _ = user_setup
+    r = install(src, {**env, "OMARCHY": str(tmp_path / "no-such-omarchy")}, "--user")
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == SYSTEMCTL_INSTALL
+    assert f"omarchy not found; for the Omarchy bar widget run: {PLUGIN_ADD}" in r.stdout
+
+
+@pytest.mark.parametrize("kind", ["dir", "symlink"])
+def test_user_install_leaves_an_installed_plugin_alone(user_setup, tmp_path, kind):
+    src, env, log, plugin = user_setup
+    plugin.parent.mkdir(parents=True)
+    if kind == "dir":  # what `omarchy plugin add` makes
+        plugin.mkdir()
+        (plugin / "mine").write_text("keep\n")
+    else:  # a development checkout, linked by hand
+        (tmp_path / "checkout").mkdir()
+        plugin.symlink_to(tmp_path / "checkout")
     r = install(src, env, "--user")
     assert r.returncode == 0, r.stderr
-    assert calls(logs["omarchy"]) == [RESCAN_LINKED] + ["plugin list --json"] * 3 + [
-        f"plugin enable {PLUGIN_ID}"]
+    assert calls(log) == SYSTEMCTL_INSTALL  # no add, no disable
+    assert "already installed" in r.stdout
+    if kind == "dir":
+        assert not plugin.is_symlink() and (plugin / "mine").read_text() == "keep\n"
+    else:
+        assert Path(os.readlink(plugin)) == tmp_path / "checkout"
 
 
-def test_user_install_gives_up_on_discovery_after_2_s(user_setup, tmp_path):
-    src, env, logs, _ = user_setup
-    env["OMARCHY"] = omarchy_stub(tmp_path / "omarchy-never", logs["omarchy"], discover_after=99)
-    started = time.monotonic()
-    r = install(src, env, "--user")
-    elapsed = time.monotonic() - started
-    assert r.returncode == 1
-    assert calls(logs["omarchy"]) == [RESCAN_LINKED] + ["plugin list --json"] * 40  # no enable
-    assert f"has not discovered {PLUGIN_ID}" in r.stderr
-    assert f"retry: omarchy plugin enable {PLUGIN_ID}" in r.stderr
-    assert 1.5 < elapsed < 10
-
-
-def test_user_install_shell_not_running_warns_and_skips_enable(user_setup, tmp_path):
-    src, env, logs, link = user_setup
-    env["OMARCHY_SHELL"] = shell_stub(tmp_path / "shell-down", logs["omarchy"], link, rc=1)
+def test_user_install_dangling_symlink_elsewhere_warns(user_setup, tmp_path):
+    src, env, log, plugin = user_setup
+    plugin.parent.mkdir(parents=True)
+    plugin.symlink_to(tmp_path / "moved-away")
     r = install(src, env, "--user")
     assert r.returncode == 1
-    assert calls(logs["omarchy"]) == [RESCAN_LINKED]  # no polling, no enable
-    assert ("retry: omarchy-shell shell rescanPlugins && omarchy plugin enable "
-            f"{PLUGIN_ID}") in r.stderr
-    assert link.is_symlink() and calls(logs["systemctl"]) == SYSTEMCTL_INSTALL
-
-
-def test_user_install_replaces_an_existing_symlink(user_setup, tmp_path):
-    src, env, _, link = user_setup
-    link.parent.mkdir(parents=True)
-    link.symlink_to(tmp_path / "old-checkout")  # dangling, from a moved checkout
-    r = install(src, env, "--user")
-    assert r.returncode == 0, r.stderr
-    assert Path(os.readlink(link)) == src / "omarchy-plugin"
-    assert install(src, env, "--user").returncode == 0  # idempotent upgrade
-    assert Path(os.readlink(link)) == src / "omarchy-plugin"
-
-
-def test_user_install_refuses_to_replace_a_real_dir(user_setup):
-    src, env, logs, link = user_setup
-    link.mkdir(parents=True)
-    (link / "mine").write_text("keep\n")
-    r = install(src, env, "--user")
-    assert r.returncode == 1
-    assert "not a symlink" in r.stderr and "refusing" in r.stderr
-    assert not link.is_symlink() and (link / "mine").read_text() == "keep\n"
-    assert calls(logs["systemctl"]) == SYSTEMCTL_INSTALL  # the service steps still run
-    assert calls(logs["omarchy"]) == []
+    assert calls(log) == SYSTEMCTL_INSTALL + [PLUGIN_LIST]  # add would refuse the taken path
+    assert f"retry: rm {plugin} && {PLUGIN_ADD}" in r.stderr
+    assert plugin.is_symlink()  # not ours to remove
 
 
 def test_user_install_default_plugin_dir_is_under_home(user_setup, tmp_path):
-    src, env, _, _ = user_setup
+    src, env, log, _ = user_setup
     env.pop("OMARCHY_PLUGIN_DIR")
+    (tmp_path / "home/.config/omarchy/plugins" / PLUGIN_ID).mkdir(parents=True)
     r = install(src, env, "--user")
     assert r.returncode == 0, r.stderr
-    assert (tmp_path / "home/.config/omarchy/plugins" / PLUGIN_ID).is_symlink()
+    assert calls(log) == SYSTEMCTL_INSTALL and "already installed" in r.stdout
+
+
+def test_user_install_plugin_add_declined_or_failed_is_not_an_error(user_setup, tmp_path):
+    """omarchy plugin add exits 1 also when you decline its prompt ("aborted"): the add command
+    is printed for later, and the run still succeeds."""
+    src, env, log, _ = user_setup
+    env["OMARCHY"] = recorder(tmp_path / "omarchy-fail", log, "omarchy", rc=1)
+    r = install(src, env, "--user")
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == SYSTEMCTL_INSTALL + [PLUGIN_LIST, PLUGIN_ADD]
+    assert f"Omarchy bar widget not added; to add it later run: {PLUGIN_ADD}" in r.stdout
+    assert "retry" not in r.stderr
+
+
+@pytest.mark.parametrize("listing", [
+    f'[{{"id":"{PLUGIN_ID}","enabled":true}}]',
+    f'[\n  {{\n    "name": "Power",\n    "id" :\t "{PLUGIN_ID}"\n  }}\n]\n',
+])
+def test_user_install_plugin_listed_elsewhere_is_installed(user_setup, tmp_path, listing):
+    """omarchy refuses an id it finds in another plugin dir: no offer when it lists the id."""
+    src, env, log, plugin = user_setup
+    env["OMARCHY"] = lister(tmp_path / "omarchy-lists", log, listing)
+    r = install(src, env, "--user")
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == SYSTEMCTL_INSTALL + [PLUGIN_LIST]  # no add
+    assert f"already installed (omarchy plugin list reports {PLUGIN_ID})" in r.stdout
+    assert not plugin.exists() and not plugin.is_symlink()
+
+
+@pytest.mark.parametrize("listing", ["[]\n", f'[{{"id":"{PLUGIN_ID}-extra"}}]',
+                                     f'[{{"name":"{PLUGIN_ID}"}}]', "not json"])
+def test_user_install_plugin_not_listed_is_offered(user_setup, tmp_path, listing):
+    src, env, log, _ = user_setup
+    env["OMARCHY"] = lister(tmp_path / "omarchy-lists", log, listing)
+    r = install(src, env, "--user")
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == SYSTEMCTL_INSTALL + [PLUGIN_LIST, PLUGIN_ADD]
+
+
+@pytest.mark.parametrize("target_exists", [True, False])
+@pytest.mark.parametrize("interactive", ["1", "0"])
+def test_user_install_replaces_the_legacy_link(user_setup, target_exists, interactive):
+    src, env, log, plugin = user_setup
+    target = legacy_link(src, plugin, target_exists)
+    r = install(src, {**env, "POWER_WATCH_INTERACTIVE": interactive}, "--user")
+    assert r.returncode == 0, r.stderr
+    offer = [PLUGIN_ADD] if interactive == "1" else []
+    assert calls(log) == [PLUGIN_DISABLE, RESCAN] + SYSTEMCTL_INSTALL + [PLUGIN_LIST] + offer
+    assert not plugin.exists() and not plugin.is_symlink()
+    assert f"Removed the old bundled plugin link {plugin}" in r.stdout
+    assert target.is_dir() == target_exists  # the link target is never touched
+    if interactive == "0":
+        assert PLUGIN_ADD in r.stdout
+
+
+def test_user_install_legacy_link_without_omarchy_is_still_removed(user_setup, tmp_path):
+    src, env, log, plugin = user_setup
+    legacy_link(src, plugin, target_exists=False)
+    r = install(src, {**env, "OMARCHY": str(tmp_path / "no-such-omarchy")}, "--user")
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == [RESCAN] + SYSTEMCTL_INSTALL
+    assert not plugin.is_symlink() and PLUGIN_ADD in r.stdout
+
+
+def test_user_install_legacy_disable_failure_is_info_and_still_removes(user_setup, tmp_path):
+    """The usual upgrade: the link target is gone (or no shell runs), so omarchy cannot disable
+    the plugin. That is not an error and no retry is offered; the link still goes."""
+    src, env, log, plugin = user_setup
+    legacy_link(src, plugin, target_exists=False)
+    env["OMARCHY"] = recorder(tmp_path / "omarchy-fail", log, "omarchy", rc=1)
+    r = install(src, env, "--user")
+    assert r.returncode == 0, r.stderr
+    assert "Could not disable the old bundled plugin" in r.stdout
+    assert "retry" not in r.stderr
+    assert not plugin.is_symlink()
+    assert calls(log) == [PLUGIN_DISABLE, RESCAN] + SYSTEMCTL_INSTALL + [PLUGIN_LIST, PLUGIN_ADD]
+
+
+@pytest.mark.parametrize("link_via", ["physical", "alias"])
+def test_user_install_legacy_link_by_another_path_to_the_checkout(user_setup, tmp_path,
+                                                                  link_via):
+    """install.sh run through a symlinked path to the checkout still knows its old link, made
+    through either path (target still present, so only the path match can recognise it)."""
+    src, env, log, plugin = user_setup
+    alias = tmp_path / "alias"
+    alias.symlink_to(src)
+    physical = Path(os.path.realpath(src))
+    target = legacy_link(src, plugin, target_exists=True,
+                         checkout=physical if link_via == "physical" else alias)
+    r = subprocess.run(["bash", str(alias / "install.sh"), "--user"], capture_output=True,
+                       text=True, env=env, check=False)
+    assert r.returncode == 0, r.stderr
+    assert calls(log)[:2] == [PLUGIN_DISABLE, RESCAN]
+    assert not plugin.exists() and not plugin.is_symlink()
+    assert target.is_dir()
+
+
+def test_user_install_dangling_legacy_link_from_another_checkout(user_setup, tmp_path):
+    src, env, log, plugin = user_setup
+    plugin.parent.mkdir(parents=True)
+    plugin.symlink_to(tmp_path / "old-clone" / "power-watch" / "omarchy-plugin")
+    r = install(src, env, "--user")
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == [PLUGIN_DISABLE, RESCAN] + SYSTEMCTL_INSTALL + [PLUGIN_LIST, PLUGIN_ADD]
+    assert not plugin.is_symlink()
+    assert "Removed the old bundled plugin link" in r.stdout
+
+
+def test_user_install_live_link_to_another_omarchy_plugin_dir_is_not_legacy(user_setup,
+                                                                            tmp_path):
+    src, env, log, plugin = user_setup
+    other = tmp_path / "other-checkout" / "omarchy-plugin"
+    other.mkdir(parents=True)
+    plugin.parent.mkdir(parents=True)
+    plugin.symlink_to(other)
+    r = install(src, env, "--user")
+    assert r.returncode == 0, r.stderr
+    assert calls(log) == SYSTEMCTL_INSTALL  # not disabled, not removed, no offer
+    assert Path(os.readlink(plugin)) == other and "already installed" in r.stdout
+
+
+@pytest.mark.parametrize("shell", ["fails", "absent"])
+def test_user_install_rescan_failure_is_not_an_error(user_setup, tmp_path, shell):
+    src, env, log, plugin = user_setup
+    legacy_link(src, plugin, target_exists=False)
+    if shell == "fails":  # the shell is not running
+        env["OMARCHY_SHELL"] = recorder(tmp_path / "shell-fail", log, "omarchy-shell", rc=1)
+    else:
+        env["OMARCHY_SHELL"] = str(tmp_path / "no-such-omarchy-shell")
+    r = install(src, env, "--user")
+    assert r.returncode == 0, r.stderr
+    assert not plugin.is_symlink()
+    rescans = [RESCAN] if shell == "fails" else []
+    assert calls(log) == [PLUGIN_DISABLE] + rescans + SYSTEMCTL_INSTALL + [PLUGIN_LIST, PLUGIN_ADD]
+    unreachable = "Omarchy shell not reachable" in r.stdout
+    assert unreachable == (shell == "fails")
+    assert "retry" not in r.stderr
 
 
 def test_user_install_systemctl_failures_warn_with_retry_and_exit_1(user_setup, tmp_path):
-    src, env, logs, link = user_setup
-    env["SYSTEMCTL"] = recorder(tmp_path / "systemctl-fail", logs["systemctl"], rc=1)
+    src, env, log, _ = user_setup
+    env["SYSTEMCTL"] = recorder(tmp_path / "systemctl-fail", log, "systemctl", rc=1)
     r = install(src, env, "--user")
     assert r.returncode == 1
     assert "retry: systemctl --user daemon-reload" in r.stderr
     assert "retry: systemctl --user enable power-watch.service" in r.stderr
-    assert link.is_symlink()  # every other step still ran
-    assert calls(logs["omarchy"]) == OMARCHY_ENABLE
+    assert calls(log) == SYSTEMCTL_INSTALL[:2] + [PLUGIN_LIST, PLUGIN_ADD]  # the offer still runs
 
 
 def test_user_install_restart_failure_warns(user_setup, tmp_path):
-    src, env, logs, _ = user_setup
+    src, env, log, _ = user_setup
     script = tmp_path / "systemctl-restart-fails"
-    script.write_text(f'#!/bin/sh\necho "$*" >> "{logs["systemctl"]}"\n'
+    script.write_text(f'#!/bin/sh\necho "systemctl $*" >> "{log}"\n'
                       '[ "$2" = restart ] && exit 1\nexit 0\n')
     script.chmod(0o755)
     r = install(src, {**env, "SYSTEMCTL": str(script)}, "--user")
     assert r.returncode == 1
-    assert calls(logs["systemctl"]) == SYSTEMCTL_INSTALL
+    assert calls(log) == SYSTEMCTL_INSTALL + [PLUGIN_LIST, PLUGIN_ADD]
     assert "retry: systemctl --user restart power-watch.service" in r.stderr
 
 
-def test_user_install_omarchy_failure_warns(user_setup, tmp_path):
-    src, env, logs, _ = user_setup
-    env["OMARCHY"] = omarchy_stub(tmp_path / "omarchy-fail", logs["omarchy"], rc=1)
-    r = install(src, env, "--user")
-    assert r.returncode == 1
-    assert calls(logs["omarchy"]) == OMARCHY_ENABLE
-    assert "enabling the Omarchy plugin failed" in r.stderr
-    assert f"retry: omarchy plugin enable {PLUGIN_ID}" in r.stderr
-
-
-def test_user_install_without_omarchy_prints_the_command(user_setup, tmp_path):
-    src, env, logs, link = user_setup
-    env["OMARCHY"] = str(tmp_path / "no-such-omarchy")
-    r = install(src, env, "--user")
-    assert r.returncode == 0, r.stderr
-    assert f"omarchy plugin enable {PLUGIN_ID}" in r.stdout
-    assert link.is_symlink() and calls(logs["systemctl"]) == SYSTEMCTL_INSTALL
-    assert calls(logs["omarchy"]) == []  # no rescan either
-
-
 @pytest.mark.parametrize("args", [["--user", "--uninstall"], ["--uninstall", "--user"]])
-def test_user_uninstall_disables_and_removes_link(user_setup, args):
-    src, env, logs, link = user_setup
-    assert install(src, env, "--user").returncode == 0
-    logs["systemctl"].unlink()
-    logs["omarchy"].unlink()
+def test_user_uninstall_disables_the_service(user_setup, args):
+    src, env, log, plugin = user_setup
     r = install(src, env, *args)
     assert r.returncode == 0, r.stderr
-    # disable first, rescan after the link is gone (as omarchy-plugin-remove does)
-    assert calls(logs["omarchy"]) == [f"plugin disable {PLUGIN_ID}", RESCAN_UNLINKED]
-    assert calls(logs["systemctl"]) == ["--user disable --now power-watch.service"]
-    assert not link.is_symlink() and not link.exists()
-    assert (src / "omarchy-plugin").is_dir()  # the target is never touched
+    assert calls(log) == SYSTEMCTL_UNINSTALL
+    assert "omarchy plugin remove" not in r.stdout
+    assert not plugin.exists() and not plugin.is_symlink()
 
 
-def test_user_uninstall_leaves_a_real_dir(user_setup):
-    src, env, logs, link = user_setup
-    link.mkdir(parents=True)
+@pytest.mark.parametrize("kind", ["dir", "symlink"])
+def test_user_uninstall_leaves_an_installed_plugin_with_a_hint(user_setup, tmp_path, kind):
+    src, env, log, plugin = user_setup
+    plugin.parent.mkdir(parents=True)
+    if kind == "dir":
+        plugin.mkdir()
+        (plugin / "mine").write_text("keep\n")
+    else:
+        (tmp_path / "checkout").mkdir()
+        plugin.symlink_to(tmp_path / "checkout")
     r = install(src, env, "--user", "--uninstall")
     assert r.returncode == 0, r.stderr
-    assert link.is_dir() and "not a symlink" in r.stderr
-    assert calls(logs["omarchy"]) == [f"plugin disable {PLUGIN_ID}"]  # nothing removed, no rescan
+    assert calls(log) == SYSTEMCTL_UNINSTALL  # omarchy is not touched
+    assert f"omarchy plugin remove {PLUGIN_ID}" in r.stdout
+    if kind == "dir":
+        assert (plugin / "mine").read_text() == "keep\n"
+    else:
+        assert Path(os.readlink(plugin)) == tmp_path / "checkout"
 
 
-def test_user_uninstall_with_shell_not_running_still_succeeds(user_setup, tmp_path):
-    src, env, logs, link = user_setup
-    assert install(src, env, "--user").returncode == 0
-    env["OMARCHY_SHELL"] = shell_stub(tmp_path / "shell-down", logs["omarchy"], link, rc=1)
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_user_uninstall_removes_the_legacy_link(user_setup, target_exists):
+    src, env, log, plugin = user_setup
+    target = legacy_link(src, plugin, target_exists)
     r = install(src, env, "--user", "--uninstall")
     assert r.returncode == 0, r.stderr
-    assert not link.is_symlink() and "next starts" in r.stdout
+    assert calls(log) == [PLUGIN_DISABLE, RESCAN] + SYSTEMCTL_UNINSTALL
+    assert not plugin.exists() and not plugin.is_symlink()
+    assert target.is_dir() == target_exists
+    assert "omarchy plugin remove" not in r.stdout
 
 
 def test_user_uninstall_failures_warn(user_setup, tmp_path):
-    src, env, logs, _ = user_setup
-    env["SYSTEMCTL"] = recorder(tmp_path / "systemctl-fail", logs["systemctl"], rc=1)
-    env["OMARCHY"] = recorder(tmp_path / "omarchy-fail", logs["omarchy"], rc=1)
+    src, env, log, plugin = user_setup
+    legacy_link(src, plugin, target_exists=False)
+    env["SYSTEMCTL"] = recorder(tmp_path / "systemctl-fail", log, "systemctl", rc=1)
+    env["OMARCHY"] = recorder(tmp_path / "omarchy-fail", log, "omarchy", rc=1)
     r = install(src, env, "--user", "--uninstall")
     assert r.returncode == 1
     assert "retry: systemctl --user disable --now power-watch.service" in r.stderr
-    assert f"retry: omarchy plugin disable {PLUGIN_ID}" in r.stderr
+    assert PLUGIN_DISABLE not in r.stderr  # a failed disable of the old link is information
+    assert "Could not disable the old bundled plugin" in r.stdout
+    assert not plugin.is_symlink()
 
 
 @pytest.mark.parametrize("args", [["--user"], ["--user", "--uninstall"]])
 def test_user_mode_refuses_root(user_setup, tmp_path, args):
-    src, env, logs, link = user_setup
+    src, env, log, plugin = user_setup
+    legacy_link(src, plugin, target_exists=False)
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     (fake_bin / "id").write_text("#!/bin/sh\necho 0\n")
@@ -548,8 +679,8 @@ def test_user_mode_refuses_root(user_setup, tmp_path, args):
     r = install(src, {**env, "PATH": f"{fake_bin}:{env['PATH']}"}, *args)
     assert r.returncode == 1
     assert "not root" in r.stderr and " ".join(args) in r.stderr
-    assert calls(logs["systemctl"]) == [] and calls(logs["omarchy"]) == []
-    assert not link.exists() and not link.is_symlink()
+    assert calls(log) == []
+    assert plugin.is_symlink()  # nothing touched, not even the legacy link
 
 
 def test_unknown_argument_is_usage_error(setup):
