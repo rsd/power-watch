@@ -1,0 +1,1686 @@
+#!/usr/bin/env python3
+"""power-watch: estimate the power-adapter load of a notebook and alert before it overloads.
+
+Most notebooks have no sensor on the adapter input, so the load on AC comes from, best first:
+1. RAPL psys (platform domain, some Intel machines): measured platform power, used as the total;
+2. otherwise an ESTIMATE: CPU package (RAPL) + discrete GPUs (nvidia-smi for NVIDIA, hwmon for
+   AMD) + rest of system (calibrated on battery) + battery charge power. A term that cannot be
+   read counts as 0 and the estimate is then a lower bound.
+On battery the discharge power (sum of all batteries) is MEASURED and used to calibrate the
+rest-of-system term. Adapter voltage, rating and the alert threshold come from the config file
+(~/.config/power-watch/config) or flags; unknown values are reported as unknown, not guessed.
+
+Read-only: it never writes sysfs or the EC. It writes only the state dir, the --log file
+and stdout/stderr. A runtime-suspended discrete GPU is never queried (that would wake it).
+Stdlib only, Python >= 3.10.
+
+`--quiet` (the systemd user service) also records history in the state dir: current.json
+(the latest sample) and three JSON Lines tiers (raw, 1-minute and 15-minute buckets) that
+`power-watch history` and the Omarchy bar widget read.
+"""
+
+import argparse
+import configparser
+import csv
+import dataclasses
+import fcntl
+import json
+import math
+import os
+import re
+import shlex
+import signal
+import statistics
+import subprocess
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+# Built-in defaults; the config file and flags override them (see Config).
+DEFAULT_REST_W = 25.0
+DEFAULT_THRESHOLD_W = 150.0  # alert threshold when the adapter rating is unknown
+THRESHOLD_OF_RATING = 0.8    # default alert threshold as a fraction of a known adapter rating
+DEFAULT_SUSTAIN_S = 10.0
+DEFAULT_ALERT_EVERY_S = 300.0
+DEFAULT_INTERVAL_S = 2.0
+REST_MIN_W, REST_MAX_W = 0.0, 200.0
+PASSIVE_WINDOW = 30
+PASSIVE_MIN_SAMPLES = 10
+PASSIVE_SAVE_EVERY_S = 30.0
+CALIBRATE_MIN_SAMPLES = 10
+UNPLUG_TIMEOUT_S = 120.0
+NVIDIA_TIMEOUT_S = 5.0
+GPU_QUERY = "pci.bus_id,power.draw,enforced.power.limit,power.min_limit,power.max_limit,pstate"
+NVIDIA_VENDOR, AMD_VENDOR, INTEL_VENDOR = "0x10de", "0x1002", "0x8086"
+CLEAR = "\x1b[H\x1b[2J"
+DEFAULT_REST_LABEL = "DEFAULT — run `power-watch calibrate`"
+
+RAPL_FIX = (
+    "Fix: run `sudo ./install.sh` from the power-watch repo (first time), or "
+    "`sudo systemd-tmpfiles --create /etc/tmpfiles.d/power-watch.conf` "
+    "(re-apply after a reboot or a rapl module reload)."
+)
+RAPL_ALARM_TITLE = "power-watch: CPU power unreadable"
+RAPL_ALARM_BODY = ("Adapter overload alerts are OFF until CPU power (RAPL) is readable. "
+                   "Fix: sudo systemd-tmpfiles --create /etc/tmpfiles.d/power-watch.conf")
+
+REPORT_KEYS = [
+    "time", "ac_online", "battery_status", "battery_capacity", "battery_w",
+    "cpu_w", "gpu_w", "gpu_limit_w", "gpu_pstate", "rest_w", "rest_source",
+    "charge_w", "total_w", "total_kind", "incomplete", "adapter_v",
+    "adapter_current_a", "adapter_rating_w", "threshold_w", "errors",
+    "total_source", "total_lower_bound", "psys_w", "gpu_status", "gpu_devices",
+]
+# The --log CSV schema is frozen: keys added to REPORT_KEYS later are JSON only.
+LOG_KEYS = [
+    "time", "ac_online", "battery_status", "battery_capacity", "battery_w",
+    "cpu_w", "gpu_w", "gpu_limit_w", "gpu_pstate", "rest_w", "rest_source",
+    "charge_w", "total_w", "total_kind", "incomplete", "adapter_v",
+    "adapter_current_a", "adapter_rating_w", "threshold_w",
+]
+CURRENT_EXTRA_KEYS = ["interval_s", "cpu_limit_w", "gpu_max_limit_w", "epoch"]
+
+
+# ---------------------------------------------------------------- environment
+
+def sysfs_root():
+    return Path(os.environ.get("POWER_WATCH_SYSFS", "/sys"))
+
+
+def nvidia_cmd():
+    return shlex.split(os.environ.get("POWER_WATCH_NVIDIA_SMI", "nvidia-smi"))
+
+
+def notify_cmd():
+    return shlex.split(os.environ.get("POWER_WATCH_NOTIFY", "notify-send"))
+
+
+def state_dir():
+    if os.environ.get("POWER_WATCH_STATE_DIR"):
+        return Path(os.environ["POWER_WATCH_STATE_DIR"])
+    xdg = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(xdg) / "power-watch"
+
+
+def wall_time():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def read_int(path):
+    text = read_text(path)
+    try:
+        return int(text) if text is not None else None
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------- config
+#
+# INI file, every key optional. Resolution, first hit wins: --config PATH, $POWER_WATCH_CONFIG
+# (both must exist), then $XDG_CONFIG_HOME/power-watch/config or ~/.config/power-watch/config
+# (missing = built-in defaults). Precedence per setting: CLI flag > config file > default.
+# Sections owned by other tools ([power-cap]) and unknown sections are ignored.
+
+class ConfigError(Exception):
+    """Unusable config file or value; main() prints it and exits 2."""
+
+
+@dataclass
+class Config:
+    """Resolved settings. None for the adapter values means unknown, never guessed."""
+    adapter_v: float | None = None    # adapter output voltage; unknown -> no amps
+    rating_w: float | None = None     # adapter rating; unknown -> no % of rating
+    threshold_w: float | None = None  # None -> derived, see `threshold`
+    sustain_s: float = DEFAULT_SUSTAIN_S
+    every_s: float = DEFAULT_ALERT_EVERY_S
+    rest_w: float = DEFAULT_REST_W    # rest of system before any calibration
+    psys: bool = True                 # use a RAPL psys domain as measured AC power when present
+    gpu_enabled: bool = True
+    gpu_devices: tuple = ()           # normalised PCI addresses; empty = all discrete GPUs
+    path: Path | None = None          # the file the settings were read from, if any
+
+    @property
+    def threshold(self):
+        """Alert threshold, W: configured, else 80 % of a known adapter rating, else 150."""
+        if self.threshold_w is not None:
+            return self.threshold_w
+        return THRESHOLD_OF_RATING * self.rating_w if self.rating_w else DEFAULT_THRESHOLD_W
+
+
+PCI_RE = re.compile(r"(?:([0-9a-f]{1,8}):)?([0-9a-f]{1,2}):([0-9a-f]{1,2})\.([0-7])")
+
+
+def normalise_pci(text):
+    """PCI address -> `dddd:bb:dd.f` lower case, or None when malformed. A short `bb:dd.f`
+    means domain 0000; nvidia-smi's 8-digit domain (`00000000:01:00.0`) is accepted."""
+    m = PCI_RE.fullmatch(str(text).strip().lower())
+    if not m:
+        return None
+    domain, bus, dev, fn = m.groups()
+    return f"{int(domain or '0', 16):04x}:{int(bus, 16):02x}:{int(dev, 16):02x}.{fn}"
+
+
+def _finite(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError("not a number") from None
+    if not math.isfinite(value):
+        raise ValueError("not a finite number")
+    return value
+
+
+def _positive_value(text):
+    value = _finite(text)
+    if value <= 0:
+        raise ValueError("must be > 0")
+    return value
+
+
+def _nonnegative_value(text):
+    value = _finite(text)
+    if value < 0:
+        raise ValueError("must be >= 0")
+    return value
+
+
+def _rest_value(text):
+    value = _finite(text)
+    if not REST_MIN_W <= value <= REST_MAX_W:
+        raise ValueError(f"must be between {REST_MIN_W:g} and {REST_MAX_W:g}")
+    return value
+
+
+def _psys_value(text):
+    word = text.strip().lower()
+    if word not in ("auto", "off"):
+        raise ValueError("must be auto or off")
+    return word == "auto"
+
+
+def _yes_no_value(text):
+    word = text.strip().lower()
+    if word not in configparser.ConfigParser.BOOLEAN_STATES:
+        raise ValueError("must be yes or no")
+    return configparser.ConfigParser.BOOLEAN_STATES[word]
+
+
+def _pci_list_value(text):
+    out = []
+    for item in re.split(r"[\s,]+", text.strip()):
+        pci = normalise_pci(item) if item else None
+        if item and pci is None:
+            raise ValueError("not a PCI address list (dddd:bb:dd.f, comma or space separated)")
+        if pci and pci not in out:
+            out.append(pci)
+    return tuple(out)
+
+
+# section -> key -> (Config field, value parser)
+CONFIG_KEYS = {
+    "adapter": {"voltage_v": ("adapter_v", _positive_value),
+                "rating_w": ("rating_w", _positive_value)},
+    "alert": {"threshold_w": ("threshold_w", _positive_value),
+              "sustain_s": ("sustain_s", _nonnegative_value),
+              "every_s": ("every_s", _nonnegative_value)},
+    "estimate": {"rest_w": ("rest_w", _rest_value), "psys": ("psys", _psys_value)},
+    "gpu": {"enabled": ("gpu_enabled", _yes_no_value), "devices": ("gpu_devices", _pci_list_value)},
+}
+
+
+def user_config_path():
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg and os.path.isabs(xdg) else Path.home() / ".config"
+    return base / "power-watch" / "config"
+
+
+def config_path(flag=None):
+    """(path, required): --config, then $POWER_WATCH_CONFIG (both required), then the user file."""
+    if flag:
+        return Path(flag), True
+    if os.environ.get("POWER_WATCH_CONFIG"):
+        return Path(os.environ["POWER_WATCH_CONFIG"]), True
+    return user_config_path(), False
+
+
+def _parse_error(path, e):
+    """Path and line numbers only: never echo the content of a line."""
+    numbers = [item[0] for item in getattr(e, "errors", None) or ()
+               if isinstance(item, tuple) and item and isinstance(item[0], int)]
+    if not numbers and isinstance(getattr(e, "lineno", None), int):
+        numbers = [e.lineno]
+    if numbers:
+        where = ", ".join(str(n) for n in sorted(set(numbers)))
+        return f"{path}: cannot parse line{'s' if len(set(numbers)) > 1 else ''} {where}"
+    return f"{path}: cannot parse ({type(e).__name__})"
+
+
+def load_config(flag=None):
+    """Config from the resolved file (see config_path); raises ConfigError. Unknown keys in a
+    section power-watch owns only warn; an empty value means unset."""
+    path, required = config_path(flag)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if required:
+            raise ConfigError(f"{path}: config file not found") from None
+        return Config()
+    except UnicodeDecodeError:
+        raise ConfigError(f"{path}: not UTF-8 text") from None
+    except OSError as e:
+        raise ConfigError(f"{path}: cannot read ({e.strerror or type(e).__name__})") from None
+    # default_section that no header can name: a [DEFAULT] section is just an unknown section
+    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#", ";"),
+                                       default_section="\0")
+    try:
+        parser.read_string(text, source=str(path))
+    except configparser.Error as e:
+        raise ConfigError(_parse_error(path, e)) from None
+    values = {}
+    for section in parser.sections():
+        keys = CONFIG_KEYS.get(section)
+        if keys is None:
+            continue
+        for key, raw in parser.items(section):
+            if key not in keys:
+                print(f"power-watch: warning: {path} [{section}] {key}: unknown key, ignored",
+                      file=sys.stderr)
+                continue
+            if raw is None or not raw.strip():
+                continue
+            name, parse = keys[key]
+            try:
+                values[name] = parse(raw)
+            except ValueError as e:
+                raise ConfigError(f"{path} [{section}] {key}: invalid value ({e})") from None
+    return dataclasses.replace(Config(), path=path, **values)
+
+
+FLAG_FIELDS = (("adapter_voltage", "adapter_v"), ("adapter_rating", "rating_w"),
+               ("threshold", "threshold_w"), ("sustain", "sustain_s"),
+               ("alert_every", "every_s"), ("rest", "rest_w"))
+
+
+def apply_flags(cfg, args):
+    """CLI flags over the file values (a flag left unset is None)."""
+    over = {name: getattr(args, flag) for flag, name in FLAG_FIELDS
+            if getattr(args, flag, None) is not None}
+    if getattr(args, "no_psys", False):
+        over["psys"] = False
+    if getattr(args, "no_gpu", False):
+        over["gpu_enabled"] = False
+    if getattr(args, "gpu", None):  # explicit devices select (and enable) the GPU term
+        over["gpu_enabled"], over["gpu_devices"] = True, tuple(dict.fromkeys(args.gpu))
+    return dataclasses.replace(cfg, **over)
+
+
+# ----------------------------------------------------------------------- RAPL
+
+class RaplError(Exception):
+    pass
+
+
+def _top_zones(root):
+    """Top-level powercap zones: `intel-rapl:N` dirs (exactly one colon)."""
+    base = Path(root) / "class" / "powercap"
+    if not base.is_dir():
+        return []
+    return [d for d in sorted(base.iterdir())
+            if d.name.startswith("intel-rapl:") and d.name.count(":") == 1]
+
+
+def rapl_zones(root):
+    """Package zones: top-level `intel-rapl:N` zones named `package-*` (one per CPU socket)."""
+    return [d for d in _top_zones(root) if (read_text(d / "name") or "").startswith("package-")]
+
+
+def psys_zone(root):
+    """The top-level zone named `psys` (platform power, on some Intel machines), or None."""
+    return next((d for d in _top_zones(root) if read_text(d / "name") == "psys"), None)
+
+
+def read_rapl(root):
+    """Return {zone: (energy_uj, max_energy_range_uj)}; raise RaplError carrying the fix hint."""
+    zones = rapl_zones(root)
+    if not zones:
+        raise RaplError(f"No RAPL package zone under {Path(root) / 'class/powercap'}, so CPU power "
+                        f"is unknown (is the intel_rapl_msr module loaded?). {RAPL_FIX}")
+    out = {}
+    for d in zones:
+        path = d / "energy_uj"
+        try:
+            energy = int(path.read_text())
+        except PermissionError:
+            raise RaplError(f"Cannot read {path}: RAPL energy_uj is root-only (mode 0400), "
+                            f"so CPU power is unknown. {RAPL_FIX}") from None
+        except (OSError, ValueError) as e:
+            raise RaplError(f"Cannot read {path} ({e}), so CPU power is unknown. {RAPL_FIX}") from None
+        out[d.name] = (energy, read_int(d / "max_energy_range_uj"))
+    return out
+
+
+def energy_delta(e1, e2, max_range):
+    if e2 >= e1:
+        return e2 - e1
+    return None if not max_range else e2 + max_range - e1
+
+
+def rapl_watts(r1, r2, dt):
+    """Package power from two read_rapl() readings dt seconds apart (handles counter wrap)."""
+    if dt <= 0 or set(r1) != set(r2):
+        return None
+    total = 0
+    for zone, (e1, max_range) in r1.items():
+        delta = energy_delta(e1, r2[zone][0], max_range)
+        if delta is None:
+            return None
+        total += delta
+    return total / 1e6 / dt
+
+
+class RaplMeter:
+    def __init__(self, root):
+        self.root = root
+        self.prev = None
+
+    def sample(self, now):
+        """Return (watts | None, error | None); the first successful read only primes."""
+        try:
+            reading = read_rapl(self.root)
+        except RaplError as e:
+            self.prev = None
+            return None, str(e)
+        prev, self.prev = self.prev, (now, reading)
+        if prev is None:
+            return None, None
+        return rapl_watts(prev[1], reading, now - prev[0]), None
+
+
+class PsysMeter:
+    """Platform power from the RAPL psys zone; its own meter, never part of the CPU term.
+    No psys zone or an unreadable one is not an error: the model falls back to the estimate."""
+
+    def __init__(self, root):
+        self.root = root
+        self.prev = None
+
+    def sample(self, now):
+        """Return watts or None; the first successful read only primes."""
+        zone = psys_zone(self.root)
+        energy = read_int(zone / "energy_uj") if zone else None
+        if energy is None:
+            self.prev = None
+            return None
+        reading = {zone.name: (energy, read_int(zone / "max_energy_range_uj"))}
+        prev, self.prev = self.prev, (now, reading)
+        return None if prev is None else rapl_watts(prev[1], reading, now - prev[0])
+
+
+def read_cpu_limit(root):
+    """PL1 in W summed over the RAPL package zones, or None when none is readable."""
+    limits = [read_int(d / "constraint_0_power_limit_uw") for d in rapl_zones(root)]
+    if not limits or None in limits:
+        return None
+    return sum(limits) / 1e6
+
+
+# -------------------------------------------------------------------- GPU
+#
+# Discrete GPUs are found in sysfs (PCI display class 0x03xxxx). Each device's runtime PM
+# status is read FIRST: nvidia-smi and hwmon reads wake a runtime-suspended GPU (and keep it
+# from suspending), so a suspended GPU counts as 0 W and is not queried at all. The class,
+# vendor and runtime_status attributes are cached by the PCI core and do not wake the device.
+
+@dataclass
+class GpuDevice:
+    pci: str
+    vendor: str                 # "nvidia" | "amd"
+    status: str = "active"      # "active" | "suspended" | "unknown"
+    power_w: float | None = None
+    limit_w: float | None = None
+    max_limit_w: float | None = None
+    pstate: str | None = None
+    error: str | None = None
+
+    def summary(self):
+        return {"pci": self.pci, "vendor": self.vendor, "status": self.status,
+                "power_w": _r(self.power_w)}
+
+
+@dataclass
+class Gpu:
+    """All selected discrete GPUs together: power and limits summed, pstate of the first
+    active NVIDIA device. `status` None means derived from power_w (unknown when None)."""
+    power_w: float | None = None
+    limit_w: float | None = None
+    pstate: str | None = None
+    error: str | None = None
+    max_limit_w: float | None = None
+    status: str | None = None   # "active" | "suspended" | "none" | "disabled" | "unknown"
+    devices: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
+
+    @property
+    def state(self):
+        if self.status is not None:
+            return self.status
+        return "unknown" if self.power_w is None else "active"
+
+
+def _num(text):
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def pci_devices_dir(root):
+    return Path(root) / "bus" / "pci" / "devices"
+
+
+def hwmon_dirs(dev):
+    return sorted((Path(dev) / "hwmon").glob("hwmon*"))
+
+
+def amd_is_apu(dev):
+    """True for an AMD APU's integrated GPU. Heuristic: amdgpu exposes the `in1_input` hwmon
+    sensor (vddnb, the APU northbridge rail) only on APUs. An APU's GPU power is already inside
+    the CPU package (RAPL), and its hwmon power1_* reports the whole socket, so it must not be
+    added. Existence check only: stat() on a sysfs attribute does not call the driver."""
+    return any((h / "in1_input").exists() for h in hwmon_dirs(dev))
+
+
+def discover_gpus(root):
+    """[(pci, vendor, sysfs dir)] of discrete GPUs: NVIDIA, and AMD except APUs. Intel display
+    devices are integrated (their power is inside the CPU package) and other vendors have no
+    reader here, so both are skipped."""
+    try:
+        entries = sorted(pci_devices_dir(root).iterdir())
+    except OSError:
+        return []
+    found = []
+    for d in entries:
+        if not (read_text(d / "class") or "").lower().startswith("0x03"):
+            continue
+        vendor = (read_text(d / "vendor") or "").lower()
+        pci = normalise_pci(d.name) or d.name
+        if vendor == NVIDIA_VENDOR:
+            found.append((pci, "nvidia", d))
+        elif vendor == AMD_VENDOR and not amd_is_apu(d):
+            found.append((pci, "amd", d))
+    return found
+
+
+SUSPENDED_STATES = ("suspended", "suspending")
+
+
+def runtime_suspended(dev):
+    """True when the PCI device is runtime-suspended or on its way there: any query would wake
+    it (bin/power-cap carries a copy of this rule)."""
+    return read_text(Path(dev) / "power" / "runtime_status") in SUSPENDED_STATES
+
+
+def read_amd(dev, d):
+    """Fill an AMD GpuDevice from hwmon: power1_average (uW), else power1_input."""
+    for h in hwmon_dirs(d):
+        for name in ("power1_average", "power1_input"):
+            uw = read_int(h / name)
+            if uw is not None:
+                cap, cap_max = read_int(h / "power1_cap"), read_int(h / "power1_cap_max")
+                dev.power_w = uw / 1e6
+                dev.limit_w = None if cap is None else cap / 1e6
+                dev.max_limit_w = None if cap_max is None else cap_max / 1e6
+                return
+    dev.status = "unknown"
+    dev.error = f"GPU power unknown: no hwmon power1_average/power1_input for {dev.pci}"
+
+
+def query_nvidia(cmd, ids=None, timeout=NVIDIA_TIMEOUT_S):
+    """One nvidia-smi run for the PCI bus ids `ids` (None = every GPU). Returns
+    ({normalised pci: [power.draw, enforced limit, min, max, pstate]}, error | None)."""
+    select = ["-i", ",".join(ids)] if ids else []
+    argv = [*cmd, *select, f"--query-gpu={GPU_QUERY}", "--format=csv,noheader,nounits"]
+    try:
+        p = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return {}, f"GPU power unknown: {cmd[0]} not found"
+    except subprocess.TimeoutExpired:
+        return {}, f"GPU power unknown: {cmd[0]} timed out after {timeout:g} s"
+    except OSError as e:
+        return {}, f"GPU power unknown: cannot run {cmd[0]} ({e})"
+    if p.returncode != 0:
+        detail = ((p.stderr or p.stdout).strip().splitlines() or [""])[0]
+        return {}, f"GPU power unknown: {cmd[0]} exited {p.returncode} {detail}".rstrip()
+    rows = {}
+    for line in p.stdout.splitlines():
+        fields = [f.strip() for f in line.split(",")]
+        pci = normalise_pci(fields[0]) if len(fields) >= 6 else None
+        if pci is not None:
+            rows[pci] = fields[1:]
+    if not rows:
+        return {}, f"GPU power unknown: unexpected {cmd[0]} output {p.stdout.strip()!r}"
+    return rows, None
+
+
+def apply_nvidia_row(dev, fields, name):
+    dev.power_w, dev.limit_w, dev.max_limit_w = _num(fields[0]), _num(fields[1]), _num(fields[3])
+    dev.pstate = None if fields[4].startswith("[") else fields[4]
+    if dev.power_w is None:
+        dev.status = "unknown"
+        dev.error = f"GPU power unknown: {name} reported power.draw {fields[0]!r} for {dev.pci}"
+
+
+def combine_gpus(devices, errors=()):
+    """Aggregate per-device readings into one Gpu (see the Gpu docstring)."""
+    errs = list(dict.fromkeys([*errors, *(d.error for d in devices if d.error)]))
+    if not devices:
+        return Gpu(0.0, status="none", error="; ".join(errs) or None, errors=errs)
+    statuses = {d.status for d in devices}
+    status = ("unknown" if "unknown" in statuses else
+              "active" if "active" in statuses else "suspended")
+    known = [d.power_w for d in devices if d.power_w is not None]
+    active = [d for d in devices if d.status == "active"]
+    limits = [d.limit_w for d in active if d.limit_w is not None]
+    maxes = [d.max_limit_w for d in active if d.max_limit_w is not None]
+    return Gpu(power_w=sum(known) if known else (None if status == "unknown" else 0.0),
+               limit_w=sum(limits) if limits else None,
+               pstate=next((d.pstate for d in active if d.vendor == "nvidia"), None),
+               error="; ".join(errs) or None,
+               max_limit_w=sum(maxes) if maxes else None,
+               status=status, devices=devices, errors=errs)
+
+
+def read_gpus(root, cmd, enabled=True, select=()):
+    """Discrete GPU power. nvidia-smi runs only when a selected NVIDIA GPU is active, once for
+    all of them (`-i <bus ids>` when only a subset of the NVIDIA GPUs is to be queried)."""
+    if not enabled:
+        return Gpu(0.0, status="disabled")
+    found = discover_gpus(root)
+    errors = []
+    if select:
+        present = {pci for pci, _, _ in found}
+        errors += [f"GPU {pci} (selected) is not a discrete GPU under {pci_devices_dir(root)}"
+                   for pci in select if pci not in present]
+        chosen = [g for g in found if g[0] in select]
+    else:
+        chosen = found
+    devices = []
+    for pci, vendor, d in chosen:
+        dev = GpuDevice(pci, vendor)
+        if runtime_suspended(d):
+            dev.status, dev.power_w = "suspended", 0.0
+        elif vendor == "amd":
+            read_amd(dev, d)
+        devices.append(dev)
+    nvidia = [d for d in devices if d.vendor == "nvidia" and d.status == "active"]
+    if nvidia:
+        every = [pci for pci, vendor, _ in found if vendor == "nvidia"]
+        ids = None if [d.pci for d in nvidia] == every else [d.pci for d in nvidia]
+        rows, error = query_nvidia(cmd, ids)
+        for dev in nvidia:
+            if error:
+                dev.status, dev.error = "unknown", error
+            elif dev.pci not in rows:
+                dev.status = "unknown"
+                dev.error = f"GPU power unknown: {cmd[0]} reported no row for {dev.pci}"
+            else:
+                apply_nvidia_row(dev, rows[dev.pci], cmd[0])
+    return combine_gpus(devices, errors)
+
+
+# -------------------------------------------------------------------- battery / AC
+
+def battery_dirs(root):
+    base = Path(root) / "class" / "power_supply"
+    return sorted(d for d in base.glob("BAT*") if d.is_dir())
+
+
+def battery_watts(bat):
+    """Battery power in W: power_now (uW) if present, else |current_now (uA) x voltage_now (uV)|."""
+    power = read_int(bat / "power_now")
+    if power is not None:
+        return abs(power) / 1e6
+    current, voltage = read_int(bat / "current_now"), read_int(bat / "voltage_now")
+    if current is None or voltage is None:
+        return None
+    return abs(current * voltage) / 1e12
+
+
+def battery_capacity(bats):
+    """Charge % of all batteries together. One battery: its own `capacity`. Several: weighted
+    by energy_now/energy_full when every battery has them (else charge_now/charge_full), else
+    the mean of `capacity`."""
+    if len(bats) == 1 and read_int(bats[0] / "capacity") is not None:
+        return read_int(bats[0] / "capacity")
+    for now_name, full_name in (("energy_now", "energy_full"), ("charge_now", "charge_full")):
+        pairs = [(read_int(b / now_name), read_int(b / full_name)) for b in bats]
+        if pairs and all(now is not None and full for now, full in pairs):
+            return round(100 * sum(now for now, _ in pairs) / sum(full for _, full in pairs))
+    caps = [c for c in (read_int(b / "capacity") for b in bats) if c is not None]
+    return round(sum(caps) / len(caps)) if caps else None
+
+
+def read_batteries(root):
+    """(status, capacity %, watts) over every BAT*, or None without a battery. Status:
+    Discharging if any discharges, else Charging if any charges, else the first one's status.
+    Watts: the sum, None when any battery's power is unreadable."""
+    bats = battery_dirs(root)
+    if not bats:
+        return None
+    statuses = [read_text(b / "status") for b in bats]
+    status = ("Discharging" if "Discharging" in statuses else
+              "Charging" if "Charging" in statuses else statuses[0])
+    watts = [battery_watts(b) for b in bats]
+    return status, battery_capacity(bats), None if None in watts else sum(watts)
+
+
+def read_ac(root):
+    base = Path(root) / "class" / "power_supply"
+    candidates = [base / "AC"] + [d for d in sorted(base.glob("*"))
+                                  if d.name != "AC" and read_text(d / "type") == "Mains"]
+    for d in candidates:
+        online = read_int(d / "online")
+        if online is not None:
+            return online == 1
+    return None
+
+
+# ------------------------------------------------------------------- sampling
+
+@dataclass
+class Sample:
+    mono: float
+    time: str
+    ac_online: bool | None
+    battery_status: str | None
+    battery_capacity: int | None
+    battery_w: float | None
+    cpu_w: float | None
+    gpu: Gpu
+    rapl_error: str | None = None
+    errors: list = field(default_factory=list)
+    epoch: float | None = None  # wall-clock Unix seconds of the sample
+    psys_w: float | None = None  # RAPL psys platform power (None: no zone, unreadable, disabled)
+
+
+class Sampler:
+    def __init__(self, root=None, nvidia=None, clock=time.monotonic, sleep=time.sleep, wall=wall_time,
+                 epoch=time.time, config=None):
+        self.root = Path(root) if root is not None else sysfs_root()
+        self.nvidia = nvidia if nvidia is not None else nvidia_cmd()
+        self.clock, self.sleep, self.wall, self.epoch = clock, sleep, wall, epoch
+        self.config = config if config is not None else Config()
+        self.rapl = RaplMeter(self.root)
+        self.psys = PsysMeter(self.root) if self.config.psys else None
+
+    def prime(self):
+        """First RAPL read; returns the RAPL error message or None."""
+        now = self.clock()
+        if self.psys:
+            self.psys.sample(now)
+        return self.rapl.sample(now)[1]
+
+    def sample(self):
+        now = self.clock()
+        cpu_w, rapl_error = self.rapl.sample(now)
+        psys_w = self.psys.sample(now) if self.psys else None
+        cfg = self.config
+        gpu = read_gpus(self.root, self.nvidia, cfg.gpu_enabled, cfg.gpu_devices)
+        ac = read_ac(self.root)
+        bats = read_batteries(self.root)
+        errors = [e for e in (rapl_error, *gpu.errors) if e]
+        if ac is None:
+            errors.append(f"AC state unknown (no {self.root}/class/power_supply/AC/online)")
+        if bats is None:
+            errors.append(f"no battery found under {self.root}/class/power_supply")
+        status, capacity, watts = bats or (None, None, None)
+        return Sample(now, self.wall(), ac, status, capacity, watts, cpu_w, gpu, rapl_error,
+                      errors, self.epoch(), psys_w)
+
+    def once(self, window=1.0):
+        """One measurement; CPU power is averaged over `window` seconds."""
+        if self.prime() is None:
+            self.sleep(window)
+        return self.sample()
+
+
+# ---------------------------------------------------------------- calibration
+
+@dataclass
+class Calibration:
+    rest_w: float = DEFAULT_REST_W
+    source: str = "default"
+    samples: int = 0
+    updated: str | None = None
+    error: str | None = None
+
+
+def plausible_rest(watts):
+    return watts is not None and REST_MIN_W <= watts <= REST_MAX_W
+
+
+def calibration_path(sdir):
+    return Path(sdir) / "calibration.json"
+
+
+def load_calibration(sdir, default_rest=DEFAULT_REST_W):
+    """The saved calibration, else `default_rest` (the configured rest-of-system default)."""
+    path = calibration_path(sdir)
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return Calibration(default_rest)
+    except (OSError, ValueError) as e:
+        return Calibration(default_rest, error=f"ignoring {path}: {e}")
+    rest = data.get("rest_w") if isinstance(data, dict) else None
+    if isinstance(rest, bool) or not isinstance(rest, (int, float)) or not plausible_rest(rest):
+        return Calibration(default_rest, error=f"ignoring {path}: no plausible rest_w")
+    source = data.get("source") if data.get("source") in ("calibrate", "passive") else "calibrate"
+    samples = data.get("samples") if isinstance(data.get("samples"), int) else 0
+    return Calibration(float(rest), source, samples, data.get("updated"))
+
+
+def save_calibration(sdir, rest_w, samples, source, updated=None):
+    """Atomic write: tmp file in the same dir, then os.replace."""
+    path = calibration_path(sdir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    data = {"rest_w": round(rest_w, 2), "samples": samples,
+            "updated": updated or wall_time(), "source": source}
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, path)
+    return path
+
+
+class PassiveCalibrator:
+    """On battery: rolling window of rest samples; persists the median (rate-limited)."""
+
+    def __init__(self, sdir, window=PASSIVE_WINDOW, min_samples=PASSIVE_MIN_SAMPLES,
+                 save_every=PASSIVE_SAVE_EVERY_S):
+        self.sdir, self.min_samples, self.save_every = sdir, min_samples, save_every
+        self.window = deque(maxlen=window)
+        self.last_save = None
+        self.warned = False
+
+    def feed(self, rest_w, now):
+        """Returns the persisted median, or None when nothing was written."""
+        if not plausible_rest(rest_w):
+            return None
+        self.window.append(rest_w)
+        if len(self.window) < self.min_samples:
+            return None
+        if self.last_save is not None and now - self.last_save < self.save_every:
+            return None
+        median = statistics.median(self.window)
+        try:
+            save_calibration(self.sdir, median, len(self.window), "passive")
+        except OSError as e:
+            if not self.warned:
+                print(f"power-watch: warning: cannot save calibration: {e}", file=sys.stderr)
+                self.warned = True
+            return None
+        self.last_save = now
+        return median
+
+
+# ---------------------------------------------------------------------- model
+
+def _r(x, digits=2):
+    return None if x is None else round(x, digits)
+
+
+def model(s, cal, cfg):
+    """Build the report dict (REPORT_KEYS) from a Sample, the calibration in effect and the
+    resolved Config. Total power, best source first: on battery the measured discharge; on AC
+    (or unknown, treated as AC to stay alert) RAPL psys when present, else the estimate
+    CPU + GPU + rest + charge, where an unknown term counts as 0 (a lower bound)."""
+    errors = list(s.errors) + ([cal.error] if cal.error else [])
+    cpu, gpu, gpu_status = s.cpu_w, s.gpu.power_w, s.gpu.state
+    psys = s.psys_w if cfg.psys and s.psys_w is not None and s.psys_w > 0 else None
+    charging = s.battery_status == "Charging"
+    if s.ac_online is False:  # on battery: the batteries supply everything, measured
+        total, kind, source, charge = s.battery_w, "measured", "battery", 0.0
+        incomplete = total is None
+    else:
+        charge = (s.battery_w or 0.0) if charging else 0.0
+        if psys is not None:
+            # Measured platform power. Whether firmware psys includes battery charge power is
+            # platform-dependent, so charge_w is reported but not added.
+            total, kind, source, incomplete = psys, "measured", "psys", False
+        else:
+            incomplete = cpu is None or gpu_status == "unknown" or (charging and s.battery_w is None)
+            total = (cpu or 0.0) + (gpu or 0.0) + cal.rest_w + charge
+            kind, source = "estimated", "model"
+    current = (total / cfg.adapter_v if source != "battery" and total is not None and cfg.adapter_v
+               else None)
+    return {
+        "time": s.time, "ac_online": s.ac_online, "battery_status": s.battery_status,
+        "battery_capacity": s.battery_capacity, "battery_w": _r(s.battery_w),
+        "cpu_w": _r(cpu), "gpu_w": _r(gpu), "gpu_limit_w": _r(s.gpu.limit_w),
+        "gpu_pstate": s.gpu.pstate, "rest_w": _r(cal.rest_w), "rest_source": cal.source,
+        "charge_w": _r(charge), "total_w": _r(total), "total_kind": kind,
+        "incomplete": incomplete, "adapter_v": cfg.adapter_v, "adapter_current_a": _r(current),
+        "adapter_rating_w": cfg.rating_w, "threshold_w": cfg.threshold, "errors": errors,
+        "total_source": source,
+        "total_lower_bound": kind == "estimated" and incomplete and total is not None,
+        "psys_w": _r(psys), "gpu_status": gpu_status,
+        "gpu_devices": [d.summary() for d in s.gpu.devices],
+    }
+
+
+def _source(report):
+    """total_source, tolerating reports from before it existed."""
+    return report.get("total_source") or ("battery" if report.get("total_kind") == "measured"
+                                          else "model")
+
+
+def unknown_terms(report):
+    """Names of the estimate terms that were unknown (counted as 0)."""
+    terms = []
+    if report.get("cpu_w") is None:
+        terms.append("CPU power")
+    if report.get("gpu_status") == "unknown":
+        terms.append("GPU power")
+    if report.get("battery_status") == "Charging" and report.get("battery_w") is None:
+        terms.append("battery charge power")
+    return terms
+
+
+def rest_sample(report):
+    """Measured rest of system (battery - CPU - GPU) while discharging, else None."""
+    if (_source(report) != "battery" or report["battery_status"] != "Discharging"
+            or report.get("gpu_status") == "unknown"
+            or None in (report["total_w"], report["cpu_w"], report["gpu_w"])):
+        return None
+    return report["total_w"] - report["cpu_w"] - report["gpu_w"]
+
+
+# ---------------------------------------------------------------- alerts, log
+
+def send_notification(cmd, title, body):
+    """Critical desktop notification; returns a problem string, or None when it was sent."""
+    try:
+        p = subprocess.run([*cmd, "-u", "critical", title, body],
+                           check=False, capture_output=True, timeout=10)
+        return f"exited {p.returncode}" if p.returncode else None
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return str(e)
+
+
+class Alerter:
+    def __init__(self, threshold, sustain, every, notify=None):
+        self.threshold, self.sustain, self.every = threshold, sustain, every
+        self.notify = notify if notify is not None else notify_cmd()
+        self.above_since = None
+        self.last_alert = None
+        self.warned = False
+
+    def update(self, report, now):
+        """Returns True when an alert was sent. Only on AC, and only with psys measured or with
+        an estimate whose CPU term is known: without CPU power the estimate under-reads badly,
+        and RaplAlarm is the alert then. Another unknown term (GPU, charge) still alerts,
+        labelled as a lower bound."""
+        source = _source(report)
+        on_ac = report.get("ac_online") is not False and source != "battery"
+        known = on_ac and (source == "psys" or report["cpu_w"] is not None)
+        total = report["total_w"] if known else None
+        if total is None or total <= self.threshold:
+            self.above_since = None
+            return False
+        if self.above_since is None:
+            self.above_since = now
+        if now - self.above_since < self.sustain:
+            return False
+        if self.last_alert is not None and now - self.last_alert < self.every:
+            return False
+        self.last_alert = now
+        self.send(report)
+        return True
+
+    def send(self, report):
+        total = report["total_w"]
+        lower = report.get("total_lower_bound",
+                           report.get("incomplete") and _source(report) == "model")
+        title = f"Power adapter overload: {'≥ ' if lower else ''}~{total:.0f} W"
+        what = "Measured" if _source(report) == "psys" else "Estimated"
+        amps, volts = report.get("adapter_current_a"), report.get("adapter_v")
+        terms = " and ".join(unknown_terms(report)) or "some terms"
+        body = (f"{what} adapter load {total:.0f} W"
+                f"{f' ({amps:.1f} A at {volts:g} V)' if amps is not None and volts else ''} "
+                f"has stayed above {self.threshold:g} W for {self.sustain:g} s"
+                f"{f' (lower bound: {terms} unknown)' if lower else ''}. "
+                f"Reduce load: sudo power-cap set --safe")
+        problem = send_notification(self.notify, title, body)
+        if problem and not self.warned:
+            print(f"power-watch: warning: notification failed ({problem}); "
+                  f"alert was: {title}. {body}", file=sys.stderr)
+            self.warned = True
+
+
+class RaplAlarm:
+    """--quiet mode: CPU power unreadable is itself the alert (the service must not exit, or
+    systemd restarts it forever with nobody told). Re-notifies at most every `every` s."""
+
+    def __init__(self, every, notify=None):
+        self.every = every
+        self.notify = notify if notify is not None else notify_cmd()
+        self.down = False
+        self.last_alert = None
+        self.warned = False
+
+    def update(self, error, now):
+        """`error` is the RAPL error of this sample (None = readable). True when notified."""
+        if error is None:
+            if self.down:
+                print("power-watch: RAPL readable again", file=sys.stderr, flush=True)
+            self.down, self.last_alert = False, None
+            return False
+        self.down = True
+        if self.last_alert is not None and now - self.last_alert < self.every:
+            return False
+        self.last_alert = now
+        print(f"power-watch: {error}", file=sys.stderr, flush=True)
+        problem = send_notification(self.notify, RAPL_ALARM_TITLE, RAPL_ALARM_BODY)
+        if problem and not self.warned:
+            print(f"power-watch: warning: notification failed ({problem})", file=sys.stderr)
+            self.warned = True
+        return True
+
+
+class CsvLog:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.warned = False
+
+    def write(self, report):
+        try:
+            new = not self.path.exists() or self.path.stat().st_size == 0
+            with self.path.open("a", newline="") as f:
+                writer = csv.writer(f)
+                if new:
+                    writer.writerow(LOG_KEYS)
+                writer.writerow(["" if report[k] is None else report[k] for k in LOG_KEYS])
+        except OSError as e:
+            if not self.warned:
+                print(f"power-watch: warning: cannot write log {self.path}: {e}", file=sys.stderr)
+                self.warned = True
+
+
+# -------------------------------------------------------------------- history
+#
+# Single writer: `--quiet` only, guarded by a non-blocking flock on <state>/history.lock.
+# current.json is the latest --once --json report plus CURRENT_EXTRA_KEYS, replaced
+# atomically each sample. Each tier is JSON Lines, one bucket per line, append-only between
+# compactions; a raw line is a 1-sample bucket. Readers skip unparsable lines (torn tail).
+
+CURRENT_FILE = "current.json"
+LOCK_FILE = "history.lock"
+COMPACT_FACTOR = 1.25  # compact a tier when its line count exceeds this x retention points
+STALE_CURRENT_INTERVALS = 3  # current.json older than this many intervals is stale
+
+
+@dataclass(frozen=True)
+class Tier:
+    name: str
+    file: str
+    step: float | None  # bucket width, s; None = one line per sample (raw)
+    retention: float    # s
+
+
+TIERS = (
+    Tier("raw", "history-raw.jsonl", None, 3600.0),
+    Tier("1m", "history-1m.jsonl", 60.0, 48 * 3600.0),
+    Tier("15m", "history-15m.jsonl", 900.0, 14 * 86400.0),
+)
+TIER_BY_NAME = {tier.name: tier for tier in TIERS}
+RANGES = {"1h": ("raw", 3600.0), "24h": ("1m", 86400.0), "7d": ("15m", 7 * 86400.0)}
+
+
+def _isnum(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def parse_point(raw):
+    """One history line -> dict with a numeric `t`, or None (unparsable, e.g. a torn tail)."""
+    try:
+        point = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return point if isinstance(point, dict) and _isnum(point.get("t")) else None
+
+
+def last_point_t(path, tail=4096):
+    """`t` of the last parsable line, reading only the end of the file."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail))
+            data = f.read()
+    except OSError:
+        return None
+    for raw in reversed(data.splitlines()):
+        point = parse_point(raw)
+        if point is not None:
+            return point["t"]
+    return None
+
+
+def compact_file(path, keep_after, keep_until=math.inf):
+    """Atomically rewrite `path` keeping parsable lines with keep_after < t <= keep_until
+    (tmp in the same dir, fsync, os.replace). The upper bound drops lines written while the
+    clock was ahead. Streams line by line. Returns (lines kept, largest kept t or None)."""
+    path = Path(path)
+    try:
+        src = path.open("rb")
+    except FileNotFoundError:
+        return 0, None
+    tmp = path.with_name(f"{path.name}.tmp")
+    kept, last = 0, None
+    with src, tmp.open("wb") as out:
+        for raw in src:
+            point = parse_point(raw)
+            if point is None or not keep_after < point["t"] <= keep_until:
+                continue
+            out.write(raw.rstrip(b"\r\n") + b"\n")
+            kept += 1
+            last = point["t"] if last is None else max(last, point["t"])
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, path)
+    return kept, last
+
+
+class Bucket:
+    """Consolidates samples (current.json dicts) into one history line."""
+
+    MEANS = (("avg", "total_w"), ("cpu", "cpu_w"), ("gpu", "gpu_w"), ("rest", "rest_w"),
+             ("chg", "charge_w"), ("ac", "ac"))
+
+    def __init__(self, t):
+        self.t = t
+        self.n = 0
+        self.sums = {key: [0.0, 0] for _, key in self.MEANS}
+        self.max = None
+        self.kinds = set()
+
+    def add(self, rec):
+        self.n += 1
+        ac = rec.get("ac_online")
+        values = {key: rec.get(key) for _, key in self.MEANS}
+        values["ac"] = None if ac is None else (1.0 if ac else 0.0)
+        for key, value in values.items():
+            if value is not None:
+                self.sums[key][0] += value
+                self.sums[key][1] += 1
+        total = rec.get("total_w")
+        if total is not None:
+            self.max = total if self.max is None else max(self.max, total)
+        self.kinds.add(rec.get("total_kind"))
+
+    def line(self):
+        """`ac` is the mean over samples whose AC state is known (null if none is)."""
+        line = {"t": round(float(self.t), 2), "n": self.n}
+        for name, key in self.MEANS:
+            total, count = self.sums[key]
+            line[name] = round(total / count, 2) if count else None
+            if name == "avg":
+                line["max"] = _r(self.max)
+        line["k"] = ("m" if self.kinds == {"measured"} else
+                     "e" if self.kinds == {"estimated"} else "x")
+        return line
+
+
+def current_report(report, s, interval, root):
+    """current.json content: the --once --json report plus CURRENT_EXTRA_KEYS."""
+    return {**report, "interval_s": float(interval), "cpu_limit_w": read_cpu_limit(root),
+            "gpu_max_limit_w": _r(s.gpu.max_limit_w), "epoch": s.epoch}
+
+
+class History:
+    """Writes current.json and the history tiers. start() takes the lock; without it every
+    other method is a no-op, so a second --quiet instance keeps alerting but writes nothing."""
+
+    def __init__(self, sdir, interval, epoch=time.time):
+        self.sdir, self.interval, self.epoch = Path(sdir), float(interval), epoch
+        self.enabled = False
+        self.lock_fd = None
+        self.last_t = {tier.name: None for tier in TIERS}
+        self.count = {tier.name: 0 for tier in TIERS}
+        # line count above which a tier is compacted again (see compact())
+        self.compact_at = {tier.name: COMPACT_FACTOR * self.retention_points(tier) for tier in TIERS}
+        self.open = {tier.name: None for tier in TIERS}
+        self.warned = False
+
+    def _warn(self, message):
+        if not self.warned:
+            print(f"power-watch: warning: {message}", file=sys.stderr, flush=True)
+            self.warned = True
+
+    def path(self, tier):
+        return self.sdir / tier.file
+
+    def step(self, tier):
+        return tier.step or self.interval
+
+    def retention_points(self, tier):
+        return tier.retention / self.step(tier)
+
+    def start(self):
+        lock = self.sdir / LOCK_FILE
+        try:
+            self.sdir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as e:
+            self._warn(f"cannot open {lock} ({e}); not recording history or current.json")
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            print(f"power-watch: warning: {lock} is held by another power-watch --quiet; this one "
+                  "keeps alerting but does not write history or current.json",
+                  file=sys.stderr, flush=True)
+            return False
+        self.lock_fd, self.enabled = fd, True
+        now = self.epoch()
+        for tier in TIERS:
+            self.last_t[tier.name] = last_point_t(self.path(tier))
+            self.compact(tier, now)
+        return True
+
+    def compact(self, tier, now):
+        """Keep now - retention < t <= now + step (lines past that were written while the clock
+        was ahead). The next compaction comes after another (COMPACT_FACTOR - 1) x retention
+        points, so a file that cannot shrink below the threshold (e.g. history recorded at a
+        shorter interval) is not rewritten on every sample. Returns True on success."""
+        points = self.retention_points(tier)
+        slack = (COMPACT_FACTOR - 1) * points
+        try:
+            kept, last = compact_file(self.path(tier), now - tier.retention, now + self.step(tier))
+        except OSError as e:
+            self._warn(f"cannot compact {self.path(tier)}: {e}")
+            self.compact_at[tier.name] = self.count[tier.name] + slack
+            return False
+        self.count[tier.name], self.last_t[tier.name] = kept, last
+        self.compact_at[tier.name] = max(kept, points) + slack
+        return True
+
+    def record(self, rec):
+        """One sample (a current_report() dict) -> current.json, raw line, open buckets."""
+        if not self.enabled:
+            return
+        self.write_current(rec)
+        epoch = rec["epoch"]
+        for tier in TIERS:
+            if tier.step is None:
+                bucket = Bucket(epoch)
+                bucket.add(rec)
+                self.append(tier, bucket, epoch)
+                continue
+            start = math.floor(epoch / tier.step) * tier.step
+            bucket = self.open[tier.name]
+            if bucket is not None and start > bucket.t:
+                # closed before the write: a Stop during append() must not let flush() write it again
+                self.open[tier.name] = None
+                self.append(tier, bucket, epoch)
+                bucket = None
+            elif bucket is not None and start < bucket.t:  # clock went backwards: drop it
+                bucket = None
+            if bucket is None:
+                bucket = self.open[tier.name] = Bucket(start)
+            bucket.add(rec)
+
+    def write_current(self, rec):
+        path = self.sdir / CURRENT_FILE
+        tmp = path.with_name(f"{CURRENT_FILE}.tmp")
+        try:
+            tmp.write_text(json.dumps(rec) + "\n")
+            os.replace(tmp, path)
+        except OSError as e:
+            self._warn(f"cannot write {path}: {e}")
+
+    def append(self, tier, bucket, now):
+        """Append one line (no fsync); never one whose t is <= the last written t. If that last t
+        is ahead of `now` by more than a step, the clock had jumped forward and was corrected:
+        compaction drops the lines from the future, then the line is appended."""
+        line = bucket.line()
+        last = self.last_t[tier.name]
+        if last is not None and line["t"] <= last:
+            if last <= now + self.step(tier) or not self.compact(tier, now):
+                return False  # the clock went backwards: never rewind
+            last = self.last_t[tier.name]
+            if last is not None and line["t"] <= last:
+                return False
+        path = self.path(tier)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            try:
+                os.write(fd, (json.dumps(line) + "\n").encode())
+            finally:
+                os.close(fd)
+        except OSError as e:
+            self._warn(f"cannot append to {path}: {e}")
+            return False
+        self.last_t[tier.name] = line["t"]
+        self.count[tier.name] += 1
+        if self.count[tier.name] > self.compact_at[tier.name]:
+            self.compact(tier, now)
+        return True
+
+    def flush(self):
+        """Clean shutdown: append the open buckets."""
+        if not self.enabled:
+            return
+        now = self.epoch()
+        for tier in TIERS:
+            bucket, self.open[tier.name] = self.open[tier.name], None
+            if bucket is not None:
+                self.append(tier, bucket, now)
+
+    def close(self):
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)  # releases the flock
+            self.lock_fd, self.enabled = None, False
+
+
+def load_points(path, since, until=math.inf):
+    """Parsable points with since <= t <= until, in file order (unparsable lines skipped;
+    points after `until` were written while the clock was ahead)."""
+    points = []
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                point = parse_point(raw)
+                if point is not None and since <= point["t"] <= until:
+                    points.append(point)
+    except OSError:
+        pass
+    return points
+
+
+def load_current(sdir):
+    try:
+        data = json.loads((Path(sdir) / CURRENT_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def history_report(sdir, range_name, now, default_threshold=DEFAULT_THRESHOLD_W):
+    """The `power-watch history --json` object for one range; the threshold comes from
+    current.json, else `default_threshold` (the configured one)."""
+    tier_name, span = RANGES[range_name]
+    tier = TIER_BY_NAME[tier_name]
+    current = load_current(sdir) or {}
+    interval = current.get("interval_s")
+    interval = interval if _isnum(interval) and interval > 0 else DEFAULT_INTERVAL_S
+    points = load_points(Path(sdir) / tier.file, now - span, now)
+    maxes = [p["max"] for p in points if _isnum(p.get("max"))]
+    weighted = [(p["avg"], p["n"]) for p in points
+                if _isnum(p.get("avg")) and _isnum(p.get("n")) and p["n"] > 0]
+    total_n = sum(n for _, n in weighted)
+    epoch = current.get("epoch")
+    if _isnum(epoch) and now - epoch <= STALE_CURRENT_INTERVALS * interval:
+        now_w = current.get("total_w") if _isnum(current.get("total_w")) else None
+    else:
+        now_w = points[-1].get("avg") if points and _isnum(points[-1].get("avg")) else None
+    threshold = current.get("threshold_w")
+    return {
+        "range": range_name, "tier": tier.name, "step_s": float(tier.step or interval),
+        "from": now - span, "to": now, "points": points,
+        "stats": {"max": _r(max(maxes)) if maxes else None,
+                  "avg": _r(sum(a * n for a, n in weighted) / total_n) if total_n else None,
+                  "current": _r(now_w)},
+        "threshold_w": float(threshold) if _isnum(threshold) else float(default_threshold),
+    }
+
+
+def show_history(sdir, range_name, as_json, now, default_threshold=DEFAULT_THRESHOLD_W):
+    data = history_report(sdir, range_name, now, default_threshold)
+    if as_json:
+        print(json.dumps(data))
+        return 0
+    stats = data["stats"]
+    print(f"Max      {_w(stats['max'])}")
+    print(f"Average  {_w(stats['avg'])}")
+    print(f"Current  {_w(stats['current'])}")
+    print(f"{len(data['points'])} points over the last {range_name} "
+          f"({data['tier']} tier, every {data['step_s']:g} s)")
+    return 0
+
+
+# -------------------------------------------------------------------- monitor
+
+class Monitor:
+    def __init__(self, sampler, sdir, config, alerter=None, log=None, passive=None, history=None):
+        self.sampler, self.sdir, self.config = sampler, sdir, config
+        self.alerter, self.log, self.passive, self.history = alerter, log, passive, history
+        self.history_warned = False
+        self.last_rest = None
+        self.last_sample = None
+
+    def tick(self):
+        s = self.last_sample = self.sampler.sample()
+        report = model(s, load_calibration(self.sdir, self.config.rest_w), self.config)
+        self.last_rest = rest_sample(report)
+        if self.passive and self.last_rest is not None:
+            self.passive.feed(self.last_rest, s.mono)
+        if self.alerter:
+            self.alerter.update(report, s.mono)
+        if self.log:
+            self.log.write(report)
+        if self.history:
+            try:
+                self.history.record(current_report(report, s, self.history.interval,
+                                                   self.sampler.root))
+            except Stop:
+                raise
+            except Exception as e:  # noqa: BLE001 -- history must never stop the alerting
+                if not self.history_warned:
+                    print(f"power-watch: warning: recording history failed ({type(e).__name__}: "
+                          f"{e}); alerting continues", file=sys.stderr, flush=True)
+                    self.history_warned = True
+        return report
+
+
+def _w(x, width=6):
+    return f"{x:{width}.1f} W" if x is not None else f"{'?':>{width}}  "
+
+
+GPU_STATUS_LABEL = {"suspended": "suspended, not queried", "none": "no discrete GPU",
+                    "disabled": "disabled: --no-gpu or [gpu] enabled = no"}
+
+
+def render_gpu(r):
+    label = GPU_STATUS_LABEL.get(r.get("gpu_status"))
+    if label is None:  # active or unknown
+        limit = f"limit {r['gpu_limit_w']:.0f} W" if r["gpu_limit_w"] is not None else "limit ?"
+        count = len(r.get("gpu_devices") or ())
+        label = f"{limit}, {r['gpu_pstate'] or 'P?'}{f', {count} GPUs' if count > 1 else ''}"
+    return f"GPU           {_w(r['gpu_w'])}  ({label})"
+
+
+def render_adapter(r, config_path=None):
+    """config_path: the config file in effect, named in the 'rating not configured' hint
+    (default: the user file)."""
+    parts = []
+    if r["adapter_current_a"] is not None:
+        parts.append(f"{r['adapter_current_a']:6.2f} A at {r['adapter_v']:g} V")
+    if r["adapter_rating_w"]:
+        parts.append(f"{100 * r['total_w'] / r['adapter_rating_w']:.0f} % of {r['adapter_rating_w']:g} W")
+    else:
+        parts.append(f"rating not configured (set rating_w under [adapter] in "
+                     f"{config_path or user_config_path()}, "
+                     f"or --adapter-rating W)")
+    return "Adapter       " + ", ".join(parts)
+
+
+def render(report, monitor=None, now=None, config_path=None):
+    r = report
+    if config_path is None and monitor is not None:
+        config_path = getattr(monitor.config, "path", None)
+    total_source = _source(r)
+    bat = f"battery {r['battery_status'] or '?'} {r['battery_capacity'] if r['battery_capacity'] is not None else '?'} %"
+    source = {True: "AC online", False: "ON BATTERY", None: "AC unknown"}[r["ac_online"]]
+    rest_label = DEFAULT_REST_LABEL if r["rest_source"] == "default" else f"{r['rest_source']} calibration"
+    lines = [
+        f"Power source  {source}, {bat}",
+        f"CPU package   {_w(r['cpu_w'])}",
+        render_gpu(r),
+        f"Rest          {_w(r['rest_w'])}  ({rest_label})",
+    ]
+    if total_source == "battery":
+        measured = monitor.last_rest if monitor else rest_sample(r)
+        lines += [f"  measured    {_w(measured)}  (battery - CPU - GPU)",
+                  f"TOTAL         {_w(r['total_w'])}  measured (battery discharge)",
+                  "Adapter       unplugged: running on battery",
+                  "Threshold     n/a on battery"]
+    else:
+        if total_source == "psys":
+            lines += [f"Charge        {_w(r['charge_w'])}  (not added: psys may include it)",
+                      f"TOTAL         {_w(r['total_w'])}  measured platform power (RAPL psys)"]
+        else:
+            lower = r.get("total_lower_bound")
+            lines += [f"Charge        {_w(r['charge_w'])}",
+                      (f"TOTAL        {'≥' if lower else ' '}{_w(r['total_w'])}  estimated adapter load"
+                       f"{'  (lower bound: unknown terms counted as 0)' if lower else ''}")]
+        lines.append(render_adapter(r, config_path))
+        alerter = monitor.alerter if monitor else None
+        if r["total_w"] <= r["threshold_w"]:
+            lines.append(f"Threshold     OK (below {r['threshold_w']:g} W)")
+        elif alerter and alerter.above_since is not None and now is not None:
+            lines.append(f"Threshold     ABOVE {r['threshold_w']:g} W for {now - alerter.above_since:.0f} s "
+                         f"(alert after {alerter.sustain:g} s)")
+        else:
+            lines.append(f"Threshold     ABOVE {r['threshold_w']:g} W")
+    lines += [f"! {e}" for e in r["errors"]]
+    return "\n".join(lines) + "\n"
+
+
+class Stop(Exception):
+    pass
+
+
+def run_loop(monitor, interval, quiet, rapl_alarm=None):
+    """Live mode exits 1 when RAPL is unreadable; quiet mode (rapl_alarm required) keeps
+    sampling, retrying RAPL every interval, and lets rapl_alarm notify."""
+    sampler = monitor.sampler
+    error = sampler.prime()
+    if quiet:
+        rapl_alarm.update(error, sampler.clock())
+    elif error:
+        print(f"power-watch: {error}", file=sys.stderr)
+        return 1
+    while True:
+        sampler.sleep(interval)
+        report = monitor.tick()
+        error = monitor.last_sample.rapl_error
+        if quiet:
+            rapl_alarm.update(error, monitor.last_sample.mono)
+        elif error:  # RAPL became unreadable mid-run
+            print(f"power-watch: {error}", file=sys.stderr)
+            return 1
+        if not quiet:
+            head = f"power-watch  {report['time']}  every {interval:g} s  (Ctrl-C to quit)\n\n"
+            sys.stdout.write(CLEAR + head + render(report, monitor, sampler.clock()))
+            sys.stdout.flush()
+
+
+# ------------------------------------------------------------------ calibrate
+
+def calibrate(sampler, sdir, duration, interval, unplug_timeout=UNPLUG_TIMEOUT_S, poll=1.0):
+    clock, sleep = sampler.clock, sampler.sleep
+    error = sampler.prime()
+    if error:
+        print(f"power-watch: {error}", file=sys.stderr)
+        return 1
+    if read_ac(sampler.root) is True:
+        print(f"Unplug the power adapter now (waiting up to {unplug_timeout:g} s)…", flush=True)
+        deadline = clock() + unplug_timeout
+        while read_ac(sampler.root) is True:
+            if clock() >= deadline:
+                print(f"power-watch: adapter still plugged in after {unplug_timeout:g} s; "
+                      "calibration aborted, nothing written.", file=sys.stderr)
+                return 1
+            sleep(poll)
+        print("Adapter unplugged.", flush=True)
+        sampler.prime()  # restart the RAPL delta after the wait
+    cfg = sampler.config
+    old = load_calibration(sdir, cfg.rest_w)
+    print(f"Sampling for {duration:g} s, keep the machine in its usual state…", flush=True)
+    accepted, start = [], clock()
+    while clock() - start < duration:
+        sleep(interval)
+        s = sampler.sample()
+        if s.rapl_error:
+            print(f"power-watch: {s.rapl_error}", file=sys.stderr)
+            return 1
+        r = model(s, Calibration(cfg.rest_w), cfg)
+        rest = rest_sample(r)
+        if s.ac_online is not False or s.battery_status != "Discharging":
+            verdict = f"skipped: not discharging ({s.battery_status})"
+        elif rest is None:
+            verdict = "skipped: " + ("CPU unknown" if s.cpu_w is None else
+                                     "GPU unknown" if s.gpu.state == "unknown" else
+                                     "battery W unknown")
+        elif not plausible_rest(rest):
+            verdict = f"skipped: implausible rest {rest:.1f} W"
+        else:
+            accepted.append(rest)
+            verdict = "ok"
+        print(f"[{clock() - start:4.0f}/{duration:g} s] battery {_w(r['total_w'])} "
+              f"cpu {_w(r['cpu_w'])} gpu {_w(r['gpu_w'])} rest {_w(rest)}  {verdict} "
+              f"({len(accepted)} accepted)", flush=True)
+    if len(accepted) < CALIBRATE_MIN_SAMPLES:
+        print(f"power-watch: only {len(accepted)} usable samples (need {CALIBRATE_MIN_SAMPLES}); "
+              "nothing written. Run it again on battery, discharging.", file=sys.stderr)
+        return 1
+    median = statistics.median(accepted)
+    path = save_calibration(sdir, median, len(accepted), "calibrate")
+    was = "the default" if old.source == "default" else f"the {old.source} value"
+    print(f"Rest of system: {median:.1f} W (median of {len(accepted)} samples), "
+          f"replacing {was} {old.rest_w:.1f} W. Saved to {path}.")
+    print("You can plug the power adapter back in now.")
+    return 0
+
+
+# ------------------------------------------------------------------------ CLI
+
+def positive(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {text}")
+    return value
+
+
+def nonnegative(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text}") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {text}")
+    return value
+
+
+def rest_watts(text):
+    value = nonnegative(text)
+    if not plausible_rest(value):
+        raise argparse.ArgumentTypeError(f"must be between {REST_MIN_W:g} and {REST_MAX_W:g}, got {text}")
+    return value
+
+
+def pci_address(text):
+    pci = normalise_pci(text)
+    if pci is None:
+        raise argparse.ArgumentTypeError(f"not a PCI address (dddd:bb:dd.f or bb:dd.f): {text}")
+    return pci
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(prog="power-watch", description=__doc__.split("\n\n")[0])
+    p.add_argument("--once", action="store_true", help="one measurement, then exit")
+    p.add_argument("--json", action="store_true", help="with --once: print one JSON object")
+    p.add_argument("--window", type=positive, default=1.0, help="--once CPU window, s (default 1)")
+    p.add_argument("--quiet", action="store_true", help="headless: sample, alert, log (systemd unit)")
+    p.add_argument("--interval", type=positive, default=DEFAULT_INTERVAL_S, help="sample interval, s")
+    p.add_argument("--log", metavar="PATH", help="append one CSV row per sample")
+    p.add_argument("--config", metavar="PATH",
+                   help="config file (default $POWER_WATCH_CONFIG, else ~/.config/power-watch/config)")
+    # Defaults below are None: the value then comes from the config file, else the built-in default.
+    p.add_argument("--adapter-voltage", type=positive, metavar="V", help="adapter output voltage")
+    p.add_argument("--adapter-rating", type=positive, metavar="W", help="adapter rating")
+    p.add_argument("--threshold", type=positive, metavar="W",
+                   help="alert above W (default 80 %% of the rating, else 150)")
+    p.add_argument("--sustain", type=nonnegative, metavar="S", help="for at least S seconds (default 10)")
+    p.add_argument("--alert-every", type=nonnegative, metavar="S", help="re-alert after S (default 300)")
+    p.add_argument("--rest", type=rest_watts, metavar="W",
+                   help="rest-of-system W before calibration (default 25)")
+    gpu = p.add_mutually_exclusive_group()
+    gpu.add_argument("--no-gpu", action="store_true", help="leave GPU power out (never query a GPU)")
+    gpu.add_argument("--gpu", type=pci_address, action="append", metavar="PCI",
+                     help="only this discrete GPU (repeatable; default all)")
+    p.add_argument("--no-psys", action="store_true", help="ignore a RAPL psys domain; always estimate")
+    sub = p.add_subparsers(dest="command")
+    cal = sub.add_parser("calibrate", help="measure rest-of-system power on battery")
+    cal.add_argument("--duration", type=positive, default=60.0, help="sampling time, s (default 60)")
+    cal.add_argument("--interval", type=positive, default=argparse.SUPPRESS)
+    hist = sub.add_parser("history", help="show the power history recorded by the --quiet service")
+    hist.add_argument("--range", choices=list(RANGES), default="1h", help="time range (default 1h)")
+    hist.add_argument("--json", dest="history_json", action="store_true", help="print one JSON object")
+    args = p.parse_args(argv)
+    if args.json and not args.once:
+        p.error("--json requires --once")
+    return args
+
+
+def main(argv=None, *, clock=time.monotonic, sleep=time.sleep, epoch=time.time):
+    args = parse_args(argv)
+    try:
+        cfg = apply_flags(load_config(args.config), args)
+    except ConfigError as e:
+        print(f"power-watch: config: {e}", file=sys.stderr)
+        return 2
+    sdir = state_dir()
+    if args.command == "history":
+        return show_history(sdir, args.range, args.history_json, epoch(), cfg.threshold)
+    sampler = Sampler(clock=clock, sleep=sleep, epoch=epoch, config=cfg)
+    if args.command == "calibrate":
+        try:
+            return calibrate(sampler, sdir, args.duration, args.interval)
+        except KeyboardInterrupt:
+            print("\nCalibration interrupted; nothing written.", file=sys.stderr)
+            return 1
+    if args.once:
+        s = sampler.once(args.window)
+        report = model(s, load_calibration(sdir, cfg.rest_w), cfg)
+        if args.json:
+            print(json.dumps(report))
+        else:
+            sys.stdout.write(render(report, config_path=cfg.path))
+            if s.rapl_error:
+                print(f"power-watch: {s.rapl_error}", file=sys.stderr)
+        return 1 if s.rapl_error else 0
+    history = None
+    if args.quiet:  # only the headless service records history and current.json
+        history = History(sdir, args.interval, epoch)
+        history.start()
+    monitor = Monitor(sampler, sdir, cfg,
+                      alerter=Alerter(cfg.threshold, cfg.sustain_s, cfg.every_s),
+                      log=CsvLog(args.log) if args.log else None,
+                      passive=PassiveCalibrator(sdir), history=history)
+
+    def on_term(signum, frame):
+        raise Stop()
+
+    previous = signal.signal(signal.SIGTERM, on_term)
+    try:
+        return run_loop(monitor, args.interval, args.quiet,
+                        rapl_alarm=RaplAlarm(cfg.every_s) if args.quiet else None)
+    except (KeyboardInterrupt, Stop):
+        if history:
+            history.flush()
+        if not args.quiet:
+            print()
+        return 0
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        if history:
+            history.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

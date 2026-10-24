@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""power-cap — cap CPU (RAPL) and GPU (nvidia-smi) power while the adapter is weak.
+
+A stopgap for a power adapter that is undersized or overheating: lower the CPU
+package power limits through the Linux powercap sysfs interface (every RAPL
+package zone) and the GPU limit through `nvidia-smi -pl`. It never touches the
+embedded controller. Run `set`/`reset` with sudo.
+
+`set --safe` applies the safe caps from the [power-cap] section of the
+power-watch config (safe_cpu_w, safe_gpu_w). Unset, each defaults to half the
+original limit: half the PL1 from before the first cap (CPU, at least 5 W) and
+half the original NVIDIA enforced limit, clamped to the card's range (GPU). The GPU
+is skipped with a note when there is no NVIDIA GPU data (no device, nvidia-smi
+unavailable), configured or not. Config path, first hit wins: --config PATH,
+$POWER_WATCH_CONFIG, then (as root under sudo or doas) the invoking user's
+~/.config/power-watch/config, then $XDG_CONFIG_HOME/power-watch/config (absolute
+paths only) or ~/.config/power-watch/config. Other config sections are ignored here.
+As root, a file named by the invoking user (--config, $POWER_WATCH_CONFIG, or their
+own home) is opened with that user's identity, and only a regular file of at most
+64 KiB is read.
+
+A runtime-suspended NVIDIA GPU is never queried or capped: nvidia-smi would wake it.
+
+The original values are saved to $POWER_CAP_STATE_DIR/originals.json (default
+/run/power-cap, so they vanish on reboot, as do the limits) on the first `set`;
+`reset` restores them.
+
+Limitation: the GPU part drives NVIDIA GPU 0 only (`nvidia-smi -i 0`); its sysfs
+runtime state is read from the first NVIDIA display device in PCI address order.
+
+Environment: POWER_WATCH_SYSFS (sysfs root, default /sys), POWER_WATCH_NVIDIA_SMI
+(nvidia-smi command), POWER_CAP_STATE_DIR (default /run/power-cap),
+POWER_WATCH_CONFIG (config file).
+"""
+
+import argparse
+import configparser
+import contextlib
+import copy
+import json
+import math
+import os
+import pwd
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+MIN_CPU_W = 5
+CONFIG_SECTION = "power-cap"
+CONFIG_KEYS = ("safe_cpu_w", "safe_gpu_w")
+SAFE_HELP = "configured safe caps (default: half the original limits)"
+DEFAULT_CPU_MAX_W = 200     # used when the zone exposes no constraint max
+TOLERANCE_W = 1.0           # RAPL rounds to its power unit; accept |read - wanted| <= 1 W
+NVIDIA_TIMEOUT_S = 5
+GPU_QUERY = "power.draw,enforced.power.limit,power.min_limit,power.max_limit,pstate"
+LIMIT_KEYS = ("constraint_0_power_limit_uw", "constraint_1_power_limit_uw")
+ROOT_REFUSED = "refused (permission denied as root — power limit likely locked by firmware)"
+MAX_CONFIG_BYTES = 64 * 1024
+NVIDIA_VENDOR = "0x10de"
+SUSPENDED_STATES = ("suspended", "suspending")     # same rule as bin/power-watch
+GPU_SKIP_NO_DATA = "skipped (no NVIDIA GPU limit known; set [power-cap] safe_gpu_w or use --gpu)"
+GPU_SKIP_SUSPENDED = "skipped (NVIDIA GPU runtime-suspended; not woken to cap it)"
+
+# Module-level so tests can pretend to be root and record identity switches.
+geteuid, getegid = os.geteuid, os.getegid
+seteuid, setegid = os.seteuid, os.setegid
+getgroups, setgroups, getgrouplist = os.getgroups, os.setgroups, os.getgrouplist
+
+
+class NeedsRoot(Exception):
+    """A write was refused with EACCES/EPERM while not running as root."""
+
+
+class BadState(Exception):
+    """originals.json exists but cannot be parsed."""
+
+
+class ConfigError(Exception):
+    """The config file is missing (when named explicitly), unreadable or invalid."""
+
+
+# --- environment -----------------------------------------------------------
+
+def sysfs_root():
+    return Path(os.environ.get("POWER_WATCH_SYSFS", "/sys"))
+
+
+def nvidia_cmd():
+    return shlex.split(os.environ.get("POWER_WATCH_NVIDIA_SMI", "nvidia-smi"))
+
+
+def originals_path():
+    return Path(os.environ.get("POWER_CAP_STATE_DIR", "/run/power-cap")) / "originals.json"
+
+
+# --- config ----------------------------------------------------------------
+
+class Invoker:
+    """The user who ran power-cap as root through sudo or doas. uid/gid None: unresolved."""
+
+    def __init__(self, name, uid, gid, home):
+        self.name, self.uid, self.gid, self.home = name, uid, gid, home
+
+
+def _env_int(name):
+    """A uid/gid from the environment, or None when absent, malformed or out of uid_t range
+    (an out-of-range id would raise OverflowError, not OSError, in the identity calls)."""
+    try:
+        value = int(os.environ[name])
+    except (KeyError, ValueError):
+        return None
+    return value if 0 <= value < 2**32 - 1 else None
+
+
+def invoking_user():
+    """Invoker when running as root under sudo ($SUDO_USER, ids from $SUDO_UID/$SUDO_GID)
+    or doas ($DOAS_USER, ids from its passwd entry); $SUDO_USER wins. None otherwise."""
+    if geteuid() != 0:
+        return None
+    var = next((v for v in ("SUDO_USER", "DOAS_USER") if os.environ.get(v)), None)
+    if var is None:
+        return None
+    name = os.environ[var]
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        entry = None
+    uid = gid = None
+    if var == "SUDO_USER":
+        uid, gid = _env_int("SUDO_UID"), _env_int("SUDO_GID")
+    if entry is not None:
+        uid = entry.pw_uid if uid is None else uid
+        gid = entry.pw_gid if gid is None else gid
+    return Invoker(name, uid, gid, entry.pw_dir if entry is not None else None)
+
+
+def user_config_path():
+    """$XDG_CONFIG_HOME/power-watch/config; a relative $XDG_CONFIG_HOME is ignored (XDG spec)."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg and os.path.isabs(xdg) else Path.home() / ".config"
+    return base / "power-watch" / "config"
+
+
+def config_candidates(explicit=None):
+    """[(path, required, reader)] in resolution order; the first existing file wins.
+
+    A required path (--config, $POWER_WATCH_CONFIG) must exist. As root under sudo/doas,
+    the invoking user's file comes before root's own default. reader is the Invoker whose
+    identity opens the file (a path the invoking user chose), or None (open as is).
+    """
+    user = invoking_user()
+    named = explicit or os.environ.get("POWER_WATCH_CONFIG")
+    if named:
+        return [(Path(named), True, user)]
+    found = []
+    if user is not None and user.home:
+        found.append((Path(user.home) / ".config" / "power-watch" / "config", False, user))
+    found.append((user_config_path(), False, None))
+    return found
+
+
+@contextlib.contextmanager
+def as_user(user, path):
+    """Run the body with user's effective uid, gid and groups; root's are restored after.
+    Drop order: groups, gid, uid; restore order: uid, gid, groups."""
+    if user is None:
+        yield
+        return
+    if user.uid is None or user.gid is None:
+        raise ConfigError(f"{path}: cannot resolve invoking user {user.name}; "
+                          "not reading it as root")
+    euid, egid, groups = geteuid(), getegid(), getgroups()
+    try:
+        user_groups = getgrouplist(user.name, user.gid)
+    except OSError:
+        user_groups = [user.gid]
+    done = []
+
+    def restore():
+        if "uid" in done:
+            seteuid(euid)
+        if "gid" in done:
+            setegid(egid)
+        if "groups" in done:
+            setgroups(groups)
+
+    try:
+        for step, call, arg in (("groups", setgroups, user_groups), ("gid", setegid, user.gid),
+                                ("uid", seteuid, user.uid)):
+            call(arg)
+            done.append(step)
+    except OSError as e:
+        restore()
+        raise ConfigError(f"{path}: cannot switch to user {user.name} to read it "
+                          f"({e.strerror or 'error'})") from None
+    try:
+        yield
+    finally:
+        restore()
+
+
+def read_config_file(path, user=None):
+    """Text of a config file: opened as user (see as_user) when given, non-blocking (a FIFO
+    cannot hang it), regular files only, at most MAX_CONFIG_BYTES. Raises ConfigError, or
+    OSError/UnicodeDecodeError for the caller to word; nothing of the content is reported."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+    with as_user(user, path):
+        fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ConfigError(f"{path}: not a regular file")
+        data = b""
+        while len(data) <= MAX_CONFIG_BYTES:
+            chunk = os.read(fd, MAX_CONFIG_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > MAX_CONFIG_BYTES:
+        raise ConfigError(f"{path}: too large (over {MAX_CONFIG_BYTES // 1024} KiB)")
+    return data.decode("utf-8")
+
+
+def parse_config(path, text):
+    """{key: float} from the [power-cap] section of text; other sections are ignored.
+
+    Errors name the path, line, section and key, never the file's content: under
+    sudo this reads a file owned by another user.
+    """
+    # default_section that no header can name: [DEFAULT] is an ignored unknown section,
+    # never copied into [power-cap] (as in bin/power-watch)
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#", ";"),
+                                   default_section="\0")
+    try:
+        cp.read_string(text, source=str(path))
+    except configparser.Error as e:
+        lines = [n for n, _ in getattr(e, "errors", None) or []] or [getattr(e, "lineno", None)]
+        where = ", ".join(str(n) for n in lines if n)
+        raise ConfigError(f"{path}: parse error" + (f" at line {where}" if where else "")) from None
+    if not cp.has_section(CONFIG_SECTION):
+        return {}
+    values = {}
+    for key, raw in cp.items(CONFIG_SECTION):
+        if key not in CONFIG_KEYS:
+            print(f"power-cap: warning: {path} [{CONFIG_SECTION}] {key}: unknown key, ignored",
+                  file=sys.stderr)
+            continue
+        if not raw.strip():
+            continue                    # `key =` means unset: use the default
+        try:
+            value = float(raw)
+        except ValueError:
+            value = math.nan
+        if not math.isfinite(value) or value <= 0:
+            raise ConfigError(f"{path} [{CONFIG_SECTION}] {key}: must be a positive number")
+        values[key] = value
+    return values
+
+
+def load_config(explicit=None):
+    """(path or None, {key: float}) from the first config file found."""
+    for path, required, user in config_candidates(explicit):
+        try:
+            text = read_config_file(path, user)
+        except FileNotFoundError:
+            if required:
+                raise ConfigError(f"{path}: config file not found") from None
+            continue
+        except UnicodeDecodeError:
+            raise ConfigError(f"{path}: not UTF-8 text") from None
+        except OSError as e:
+            raise ConfigError(f"{path}: cannot read: {e.strerror or 'error'}") from None
+        return path, parse_config(path, text)
+    return None, {}
+
+
+# --- sysfs -----------------------------------------------------------------
+
+def read_text(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def read_int(path):
+    text = read_text(path)
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def write_sysfs(path, value):
+    """Write one value; return None or an error message.
+
+    A permission error as non-root raises NeedsRoot (nothing would succeed). As root
+    it means the kernel/firmware refused the write (e.g. a locked power limit MSR),
+    so it is returned like any other per-item failure.
+    """
+    try:
+        with open(path, "w") as f:
+            f.write(f"{value}\n")
+    except PermissionError as e:
+        if geteuid() == 0:
+            return ROOT_REFUSED
+        raise NeedsRoot(str(path)) from e
+    except OSError as e:
+        return f"write failed: {e.strerror or e}"
+    return None
+
+
+def write_checked(path, value, check):
+    """Write, then verify with check(path, value); return (ok, message)."""
+    err = write_sysfs(path, value)
+    return (False, err) if err else check(path, value)
+
+
+def package_zones():
+    """intel-rapl:N directories (exactly one colon) whose name is package-*."""
+    base = sysfs_root() / "class" / "powercap"
+    zones = []
+    for d in sorted(base.glob("intel-rapl:*")):
+        if d.name.count(":") == 1 and (read_text(d / "name") or "").startswith("package-"):
+            zones.append(d)
+    return zones
+
+
+def constraint(zone, n):
+    p = f"constraint_{n}_"
+    return {
+        "name": read_text(zone / f"{p}name"),
+        "limit_uw": read_int(zone / f"{p}power_limit_uw"),
+        "max_uw": read_int(zone / f"{p}max_power_uw"),
+        "window_us": read_int(zone / f"{p}time_window_us"),
+    }
+
+
+def max_w(zone, n):
+    """Upper bound for constraint n in watts; 0 or missing means 'not exposed'."""
+    uw = read_int(zone / f"constraint_{n}_max_power_uw")
+    return uw / 1e6 if uw else DEFAULT_CPU_MAX_W
+
+
+# --- nvidia-smi ------------------------------------------------------------
+
+def run_nvidia(args):
+    """Return (returncode, stdout, stderr); a missing binary/timeout is rc 127/124."""
+    cmd = nvidia_cmd() + args
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=NVIDIA_TIMEOUT_S)
+    except FileNotFoundError:
+        return 127, "", f"command not found: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {NVIDIA_TIMEOUT_S} s"
+    except OSError as e:
+        return 126, "", str(e)
+    return r.returncode, r.stdout, r.stderr
+
+
+def to_float(field):
+    try:
+        return float(field)
+    except ValueError:
+        return None
+
+
+def pci_devices_dir():
+    return sysfs_root() / "bus" / "pci" / "devices"
+
+
+def gpu_state():
+    """Runtime state of NVIDIA GPU 0, read from sysfs without waking it: "active",
+    "suspended" (runtime_status suspended or suspending), "none" (no NVIDIA display device:
+    vendor 0x10de, class 0x03xxxx), or "unknown" when the PCI device list is unreadable."""
+    try:
+        entries = sorted(pci_devices_dir().iterdir())
+    except OSError:
+        return "unknown"
+    for d in entries:
+        if ((read_text(d / "class") or "").lower().startswith("0x03")
+                and (read_text(d / "vendor") or "").lower() == NVIDIA_VENDOR):
+            status = read_text(d / "power" / "runtime_status")
+            return "suspended" if status in SUSPENDED_STATES else "active"
+    return "none"
+
+
+def gpu_probe():
+    """(state, query): gpu_query() only when the GPU may be queried (active, or unknown
+    state); None for a suspended GPU (nvidia-smi would wake it) or when there is none."""
+    state = gpu_state()
+    return state, (gpu_query() if state in ("active", "unknown") else None)
+
+
+def gpu_query():
+    """Dict draw/enforced/min/max (W or None) and pstate (str or None); None if unknown."""
+    rc, out, _ = run_nvidia(["-i", "0", f"--query-gpu={GPU_QUERY}",
+                             "--format=csv,noheader,nounits"])
+    lines = out.strip().splitlines()
+    if rc != 0 or not lines:
+        return None
+    fields = [f.strip() for f in lines[0].split(",")]
+    if len(fields) != 5:
+        return None
+    draw, enforced, lo, hi, pstate = fields
+    return {"draw": to_float(draw), "enforced": to_float(enforced), "min": to_float(lo),
+            "max": to_float(hi), "pstate": None if pstate.startswith("[") else pstate}
+
+
+def apply_gpu(watts):
+    """Run nvidia-smi -pl and verify; return (ok, message)."""
+    rc, _, err = run_nvidia(["-i", "0", "-pl", f"{watts:g}"])
+    if rc != 0:
+        first = (err.strip().splitlines() or [f"exit status {rc}"])[0]
+        return False, f"nvidia-smi error: {first}"
+    q = gpu_query()
+    got = q and q["enforced"]
+    if got is None:
+        return False, f"wrote {watts:g} W, but the enforced limit cannot be read back"
+    if abs(got - watts) <= TOLERANCE_W:
+        return True, "applied"
+    return False, f"refused by hardware/driver (wrote {watts:g} W, reads back {got:g} W)"
+
+
+# --- originals -------------------------------------------------------------
+
+def load_originals():
+    """Saved originals dict, or None when nothing is saved."""
+    path = originals_path()
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except PermissionError as e:
+        raise NeedsRoot(str(path)) from e
+    except (OSError, ValueError) as e:
+        raise BadState(f"{path}: {e}") from e
+    if not isinstance(data, dict):
+        raise BadState(f"{path}: not a JSON object")
+    return data
+
+
+def has_originals(data):
+    """True when data holds at least one value that `reset` could restore."""
+    if not data:
+        return False
+    zones = data.get("zones") or {}
+    return any(zones.values()) or (data.get("gpu") or {}).get("enforced_limit_w") is not None
+
+
+def save_originals(data):
+    """Atomic write, dir 0700, file 0600."""
+    path = originals_path()
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".originals.")
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except PermissionError as e:
+        raise NeedsRoot(str(path)) from e
+
+
+# --- verification ----------------------------------------------------------
+
+def check_rapl(path, wanted_uw):
+    got = read_int(path)
+    if got is None:
+        return False, f"wrote {wanted_uw / 1e6:g} W, but it cannot be read back"
+    if abs(got - wanted_uw) <= TOLERANCE_W * 1e6:
+        return True, "applied"
+    return False, (f"refused by hardware/driver (wrote {wanted_uw / 1e6:g} W, "
+                   f"reads back {got / 1e6:g} W)")
+
+
+def check_enabled(path, wanted):
+    got = read_int(path)
+    if got == wanted:
+        return True, "applied"
+    return False, f"refused by hardware/driver (wrote {wanted}, reads back {got})"
+
+
+def report(results):
+    """Print one line per (label, ok, message); return the exit code."""
+    for label, _, msg in results:
+        print(f"  {label}: {msg}")
+    return 0 if all(ok for _, ok, _ in results) else 1
+
+
+# --- safe caps -------------------------------------------------------------
+
+def half_w(watts):
+    """Half of watts, rounded half-up to whole W."""
+    return math.floor(watts / 2 + 0.5)
+
+
+def saved_zone_value(saved, zone_name, key):
+    entry = ((saved or {}).get("zones") or {}).get(zone_name)
+    value = entry.get(key) if isinstance(entry, dict) else None
+    return value if isinstance(value, (int, float)) else None
+
+
+def safe_cpu(config, saved, zones):
+    """(zone name -> W or None, source). Unconfigured: half the ORIGINAL PL1 of each
+    zone (saved originals when a cap is in place, else the current constraint_0), so a
+    second --safe does not halve again; at least MIN_CPU_W. None: PL1 unknown or 0."""
+    path, values = config
+    if "safe_cpu_w" in values:
+        return {z.name: values["safe_cpu_w"] for z in zones}, f"configured in {path}"
+    caps = {}
+    for z in zones:
+        key = LIMIT_KEYS[0]
+        uw = saved_zone_value(saved, z.name, key)
+        if uw is None:
+            uw = read_int(z / key)
+        caps[z.name] = max(MIN_CPU_W, half_w(uw / 1e6)) if uw else None
+    return caps, "half the original PL1"
+
+
+def safe_gpu(config, saved, q):
+    """(W or None, source). Unconfigured: half the original NVIDIA enforced limit (saved
+    originals, else the current one), clamped to [min_limit, max_limit]. None: no data."""
+    path, values = config
+    if "safe_gpu_w" in values:
+        return values["safe_gpu_w"], f"configured in {path}"
+    source = "half the original limit"
+    orig = (saved or {}).get("gpu") or {}
+    orig = orig.get("enforced_limit_w") if isinstance(orig, dict) else None
+    if not isinstance(orig, (int, float)):
+        orig = q and q["enforced"]
+    if not orig:
+        return None, source
+    watts = half_w(orig)
+    if q and q["min"] is not None:
+        watts = max(watts, q["min"])
+    if q and q["max"] is not None:
+        watts = min(watts, q["max"])
+    return watts, source
+
+
+def fmt_cpu_caps(caps):
+    """'46 W' when every zone has the same cap, else 'intel-rapl:0 46 W, ...'."""
+    shown = {name: "unknown" if w is None else f"{w:g} W" for name, w in caps.items()}
+    if len(set(shown.values())) == 1:
+        return next(iter(shown.values()))
+    return ", ".join(f"{name} {text}" for name, text in shown.items())
+
+
+def safe_line(config, zones, state, q):
+    """The 'Safe caps' status line: what `set --safe` would apply now."""
+    try:
+        saved, readable = load_originals(), True
+    except (NeedsRoot, BadState):
+        saved, readable = None, False
+    unknown = "unknown (saved originals not readable; run sudo power-cap status)"
+    caps, cpu_src = safe_cpu(config, saved, zones)
+    if not zones:
+        cpu = "n/a (no RAPL package zone)"
+    elif not readable and "safe_cpu_w" not in config[1]:
+        cpu = unknown
+    else:
+        cpu = f"{fmt_cpu_caps(caps)} ({cpu_src})"
+    watts, gpu_src = safe_gpu(config, saved, q)
+    if state == "suspended":
+        gpu = "skipped (runtime-suspended, not woken)"
+    elif q is None:
+        gpu = "skipped (no NVIDIA GPU limit known)"
+    elif not readable and "safe_gpu_w" not in config[1]:
+        gpu = unknown
+    elif watts is None:
+        gpu = "skipped (no NVIDIA GPU limit known)"
+    else:
+        gpu = f"{watts:g} W ({gpu_src})"
+    return f"Safe caps (set --safe): CPU {cpu}; GPU {gpu}"
+
+
+# --- commands --------------------------------------------------------------
+
+def fmt_w(uw):
+    return "n/a" if uw is None else f"{uw / 1e6:.1f} W"
+
+
+def fmt_window(us):
+    if us is None:
+        return "n/a"
+    if us >= 1_000_000:
+        return f"{us / 1e6:.2f} s"
+    if us >= 1000:
+        return f"{us / 1e3:.2f} ms"
+    return f"{us} us"
+
+
+def fmt_gpu(value):
+    return "n/a" if value is None else f"{value:.1f} W"
+
+
+def cmd_status(args):
+    zones = package_zones()
+    print("CPU (RAPL powercap)")
+    if not zones:
+        print("  no RAPL package zone (intel-rapl:N, package-*) found")
+    for z in zones:
+        enabled = {1: "yes", 0: "no"}.get(read_int(z / "enabled"), "n/a")
+        print(f"  {z.name} ({read_text(z / 'name')}), enabled: {enabled}")
+        for n, label in ((0, "PL1"), (1, "PL2")):
+            c = constraint(z, n)
+            if c["name"] is None and c["limit_uw"] is None:
+                continue
+            note = " (reads 0 W: not set/not exposed by firmware)" if c["limit_uw"] == 0 else ""
+            extra = f", max {fmt_w(c['max_uw'])}" if c["max_uw"] else ""
+            print(f"    {label} constraint_{n} {c['name'] or '?'}: limit {fmt_w(c['limit_uw'])}"
+                  f"{note}{extra}, window {fmt_window(c['window_us'])}")
+    print("GPU (nvidia-smi)")
+    state, q = gpu_probe()
+    if state == "suspended":
+        print("  suspended, not queried")
+    elif state == "none":
+        print(f"  n/a (no NVIDIA GPU under {pci_devices_dir()})")
+    elif q is None:
+        print("  n/a (nvidia-smi unavailable or failed)")
+    else:
+        print(f"  draw {fmt_gpu(q['draw'])}, enforced limit {fmt_gpu(q['enforced'])}, "
+              f"range {fmt_gpu(q['min'])} .. {fmt_gpu(q['max'])}, pstate {q['pstate'] or 'n/a'}")
+    print(cap_state(originals_path()))
+    print(safe_line(args.config_values, zones, state, q))
+    return 0
+
+
+def cap_state(path):
+    """One 'Cap: ...' line. os.stat, not Path.exists(): on Python 3.14 exists() returns
+    False on EACCES, which would report 'none' for a root-only /run/power-cap."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return "Cap: none set by power-cap (no saved originals)"
+    except OSError:
+        return "Cap: unknown — saved originals not readable; run sudo power-cap status"
+    try:
+        if not has_originals(load_originals()):
+            return ("Cap: none set by power-cap (empty saved originals; "
+                    "`sudo power-cap reset` clears them)")
+    except (NeedsRoot, BadState):
+        pass                    # exists but unreadable/corrupt: still an active cap
+    return f"Cap: active, originals saved in {path} (`sudo power-cap reset` restores them)"
+
+
+def cmd_set(args):
+    if args.safe and (args.cpu is not None or args.gpu is not None or args.cpu_pl2 is not None):
+        return usage_error("--safe cannot be combined with --cpu/--cpu-pl2/--gpu")
+    if args.cpu_pl2 is not None and args.cpu is None:
+        return usage_error("--cpu-pl2 needs --cpu")
+    if args.cpu is None and args.gpu is None and not args.safe:
+        return usage_error("give at least one of --cpu, --gpu or --safe")
+    want_cpu = args.safe or args.cpu is not None
+    zones = package_zones() if want_cpu else []
+    if want_cpu and not zones:
+        return usage_error("no RAPL package zone (intel-rapl:N, package-*) found; "
+                           "cannot cap the CPU")
+    state, q = gpu_probe() if args.safe or args.gpu is not None else (None, None)
+    saved = load_originals()
+    skipped = []
+    if args.safe:
+        caps, _ = safe_cpu(args.config_values, saved, zones)
+        unknown = [name for name, w in caps.items() if w is None]
+        if unknown:
+            return usage_error(f"cannot derive a safe CPU cap for {', '.join(unknown)} (PL1 reads "
+                               "0 W or is missing); set [power-cap] safe_cpu_w or use --cpu")
+        targets = [(z, caps[z.name], caps[z.name]) for z in zones]
+        # no GPU data (no device, nvidia-smi unavailable): skipped even when configured
+        gpu = safe_gpu(args.config_values, saved, q)[0] if q is not None else None
+        if state == "suspended":
+            skipped.append(("GPU", True, GPU_SKIP_SUSPENDED))
+        elif gpu is None:
+            skipped.append(("GPU", True, GPU_SKIP_NO_DATA))
+    else:
+        pl2 = args.cpu_pl2 if args.cpu_pl2 is not None else args.cpu
+        targets = [(z, args.cpu, pl2) for z in zones]
+        gpu = args.gpu
+        if gpu is not None and state == "suspended":
+            skipped.append((f"GPU {gpu:g} W", True, GPU_SKIP_SUSPENDED))
+            gpu = None
+        elif gpu is not None and state == "none":
+            skipped.append((f"GPU {gpu:g} W", False, f"no NVIDIA GPU under {pci_devices_dir()}"))
+            gpu = None
+
+    for z, pl1, pl2 in targets:
+        for n, w in ((0, pl1), (1, pl2)):
+            if not MIN_CPU_W <= w <= max_w(z, n):
+                return usage_error(f"CPU limit {w:g} W out of range for {z.name} constraint_{n} "
+                                   f"({MIN_CPU_W}..{max_w(z, n):g} W)")
+    if gpu is not None and q and q["min"] is not None and q["max"] is not None:
+        if not q["min"] <= gpu <= q["max"]:
+            return usage_error(f"GPU limit {gpu:g} W out of range ({q['min']:g}..{q['max']:g} W)")
+
+    # Save what is about to change before writing anything. Existing keys are never
+    # overwritten: they hold the values from before the first cap.
+    created = saved is None
+    data = copy.deepcopy(saved) if saved else {}
+    for z in zones:
+        entry = data.setdefault("zones", {}).setdefault(z.name, {})
+        for key in LIMIT_KEYS + ("enabled",):
+            if key not in entry and read_int(z / key) is not None:
+                entry[key] = read_int(z / key)
+    if gpu is not None and "gpu" not in data:
+        if q and q["enforced"] is not None:
+            data["gpu"] = {"enforced_limit_w": q["enforced"]}
+        else:
+            print("warning: current GPU limit unknown, `reset` will not be able to restore it")
+    if data != saved and has_originals(data):     # never write a file reset can't use
+        save_originals(data)
+
+    results, wrote = [], False
+    try:
+        for z, pl1, pl2 in targets:
+            for n, w in ((0, pl1), (1, pl2)):
+                path = z / f"constraint_{n}_power_limit_uw"
+                results.append((f"{z.name} constraint_{n} {w:g} W",
+                                *write_checked(path, int(round(w * 1e6)), check_rapl)))
+                wrote = True
+            if read_int(z / "enabled") != 1:
+                results.append((f"{z.name} enabled",
+                                *write_checked(z / "enabled", 1, check_enabled)))
+    except NeedsRoot:
+        if created and not wrote:
+            originals_path().unlink(missing_ok=True)
+        raise
+    if gpu is not None:
+        results.append((f"GPU {gpu:g} W", *apply_gpu(gpu)))
+    results += skipped
+    print("set:")
+    return report(results)
+
+
+def cmd_reset(_args):
+    data = load_originals()
+    if not has_originals(data):
+        if data is not None:    # an empty/no-op file would keep status at "Cap: active"
+            try:
+                originals_path().unlink(missing_ok=True)
+            except PermissionError as e:
+                raise NeedsRoot(str(originals_path())) from e
+        print("nothing to reset (no saved originals)")
+        return 0
+    base = sysfs_root() / "class" / "powercap"
+    results = []
+    for name, entry in sorted(data.get("zones", {}).items()):
+        zone = base / name
+        for key in LIMIT_KEYS:          # limits first, then enabled
+            if key in entry:
+                results.append((f"{name} {key.split('_power')[0]} {entry[key] / 1e6:g} W",
+                                *write_checked(zone / key, entry[key], check_rapl)))
+        if "enabled" in entry:
+            results.append((f"{name} enabled {entry['enabled']}",
+                            *write_checked(zone / "enabled", entry["enabled"], check_enabled)))
+    w = data.get("gpu", {}).get("enforced_limit_w")
+    if w is not None and gpu_state() == "suspended":
+        results.append((f"GPU {w:g} W", False, ("not restored: NVIDIA GPU runtime-suspended "
+                        "(not woken); run `sudo power-cap reset` again while it is in use")))
+    elif w is not None:
+        results.append((f"GPU {w:g} W", *apply_gpu(w)))
+    print("reset:")
+    code = report(results)
+    if code == 0:
+        originals_path().unlink()
+        print("originals restored and cleared")
+    else:
+        print(f"some values were not restored; originals kept in {originals_path()}")
+    return code
+
+
+def usage_error(msg):
+    print(f"power-cap: error: {msg}", file=sys.stderr)
+    return 2
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="power-cap",
+        description="Cap CPU package (RAPL) and GPU (nvidia-smi) power limits. "
+                    "Never writes to the EC. set/reset need root (sudo).",
+        epilog=f"--safe = {SAFE_HELP}: [power-cap] safe_cpu_w / safe_gpu_w in the power-watch "
+               "config; `power-cap status` shows the resolved values. Limits last until "
+               "reboot or `power-cap reset`.")
+    p.add_argument("--config", metavar="PATH",
+                   help="config file (default: $POWER_WATCH_CONFIG, the sudo/doas user's or your "
+                        "~/.config/power-watch/config); only [power-cap] is read")
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="show current limits, GPU state, whether a cap is active "
+                                  "and the resolved --safe caps")
+    s = sub.add_parser(
+        "set", help=f"set limits (--safe = {SAFE_HELP})",
+        description=f"Set power limits. --safe = {SAFE_HELP}. "
+                    "Original values are saved on the first set and restored by `reset`.")
+    s.add_argument("--cpu", type=float, metavar="W",
+                   help="CPU package long-term limit (PL1); also PL2 unless --cpu-pl2 is given")
+    s.add_argument("--cpu-pl2", type=float, metavar="W", help="CPU short-term limit (PL2)")
+    s.add_argument("--gpu", type=float, metavar="W", help="GPU power limit (nvidia-smi -pl)")
+    s.add_argument("--safe", action="store_true", help=SAFE_HELP)
+    sub.add_parser("reset", help="restore the saved original limits")
+    return p
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    args = build_parser().parse_args(argv)
+    handler = {"status": cmd_status, "set": cmd_set, "reset": cmd_reset}[args.command]
+    if args.command != "reset":     # reset never depends on the config: undo always works
+        try:
+            args.config_values = load_config(args.config)
+        except ConfigError as e:
+            print(f"power-cap: error: {e}", file=sys.stderr)
+            return 2
+    try:
+        return handler(args)
+    except NeedsRoot as e:
+        print(f"power-cap: needs root: run sudo power-cap {shlex.join(argv)} "
+              f"(permission denied writing {e})", file=sys.stderr)
+        return 1
+    except BadState as e:
+        print(f"power-cap: error: unreadable saved originals {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

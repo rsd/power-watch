@@ -1,0 +1,29 @@
+# power-watch as a systemd USER unit: samples estimated adapter load in the
+# background and alerts (notify-send) when it stays above the threshold. It also
+# records history (current.json, history-*.jsonl in ~/.local/state/power-watch)
+# for `power-watch history` and the Omarchy bar widget.
+#
+# install.sh points the /usr/local paths below at $PREFIX (default /usr/local) in the installed copy.
+#
+# Install: sudo ./install.sh, then as your user (enables, restarts and links the widget):
+#   ./install.sh --user
+#
+# Settings (adapter voltage/rating, alert threshold, GPU, ...) live in
+# ~/.config/power-watch/config; start from /usr/local/share/power-watch/config.example.
+# Restart the unit after editing it. Override ExecStart only for one-off flags,
+# e.g. a CSV log:
+#   systemctl --user edit power-watch
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/local/bin/power-watch --quiet --log %h/.local/state/power-watch/log.csv
+[Unit]
+Description=power-watch: estimated power adapter load monitor and alert
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/power-watch --quiet
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,73 @@
+# power-watch / power-cap configuration example.
+#
+# Copy to ~/.config/power-watch/config (or $XDG_CONFIG_HOME/power-watch/config)
+# and uncomment what you need. Every key is optional: a commented key keeps the
+# built-in default shown after it.
+#
+# Which file is read (first hit wins):
+#   1. --config PATH                     (must exist)
+#   2. $POWER_WATCH_CONFIG               (must exist)
+#   3. power-cap run as root via sudo or doas: the invoking user's
+#      ~/.config/power-watch/config (read with that user's permissions)
+#   4. $XDG_CONFIG_HOME/power-watch/config (if absolute), else ~/.config/power-watch/config
+# Precedence of a setting: command-line flag > this file > built-in default.
+# So `sudo power-cap set --safe` uses the [power-cap] values from YOUR file.
+#
+# power-watch reads [adapter], [alert], [estimate] and [gpu]; power-cap reads
+# only [power-cap]. Each ignores the other's sections (and [DEFAULT], which has no
+# special meaning here). Values are numbers unless stated. `#` and `;` start a
+# comment, on a line of its own or inline after a value when preceded by a space:
+# `rating_w = 330  # from the label`.
+
+[adapter]
+# Adapter output voltage in V (on its label). Unset: unknown, so no amps are shown.
+# voltage_v =
+# Adapter rating in W (on its label). Unset: unknown, so no % of rating is shown.
+# rating_w =
+
+[alert]
+# Alert when the estimated adapter load stays above this many W.
+# Default: 80 % of rating_w when rating_w is set, else 150.
+# threshold_w = 150
+# Seconds the load must stay above threshold_w before the alert fires.
+# sustain_s = 10
+# Seconds between repeated alerts while the load stays high.
+# every_s = 300
+
+[estimate]
+# Rest-of-system power in W (screen, board, disks) used before `power-watch calibrate`.
+# rest_w = 25
+# auto | off: use a RAPL psys domain, where the platform has one, as measured platform power.
+# psys = auto
+
+[gpu]
+# yes | no: include discrete GPU power (no is the same as --no-gpu).
+# enabled = yes
+# PCI addresses of the GPUs to read, comma or space separated (e.g. 0000:01:00.0).
+# Empty: all discrete GPUs.
+# devices =
+
+[power-cap]
+# CPU package cap in W for `power-cap set --safe`.
+# Unset: half the original PL1 (from before the first cap), at least 5 W.
+# safe_cpu_w =
+# NVIDIA GPU cap in W for `power-cap set --safe` (GPU 0 only).
+# Unset: half the original enforced limit, clamped to the card's min/max limit.
+# safe_gpu_w =
+
+# --- Example (illustration only): a gaming laptop with a 330 W, 19.5 V adapter
+# whose adapter runs hot, so it alerts well below the rating and caps hard.
+# Use these lines INSTEAD of the sections above, not in addition to them
+# (a section may appear only once).
+#
+# [adapter]
+# voltage_v = 19.5
+# rating_w = 330
+#
+# [alert]
+# threshold_w = 150
+# sustain_s = 10
+#
+# [power-cap]
+# safe_cpu_w = 45
+# safe_gpu_w = 80
