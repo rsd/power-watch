@@ -407,8 +407,10 @@ def test_quiet_writes_current_json_and_history(tmp_path, monkeypatch):
     assert run_quiet(tmp_path, monkeypatch, root, ticks=40) == 0
     sdir = tmp_path / "state"
     current = json.loads((sdir / "current.json").read_text())
-    assert list(current) == pw.REPORT_KEYS + ["interval_s", "cpu_limit_w", "gpu_max_limit_w", "epoch"]
+    assert list(current) == pw.REPORT_KEYS + ["interval_s", "cpu_limit_w", "cpu_cap", "cpu_cap_w",
+                                              "gpu_max_limit_w", "epoch"]
     assert current["interval_s"] == 2.0 and current["cpu_limit_w"] == 45.0
+    assert current["cpu_cap"] == "uncapped" and current["cpu_cap_w"] is None
     assert current["gpu_max_limit_w"] == 190.0 and current["epoch"] == BASE + 80
     assert current["cpu_w"] == 10.0 and current["total_kind"] == "estimated"
     assert isinstance(current["time"], str) and current["errors"] == []

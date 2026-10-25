@@ -230,8 +230,8 @@ frozen schema, unchanged by the newer JSON keys.
 
 ```
 power-cap status
-sudo power-cap set --cpu W [--cpu-pl2 W] --gpu W
-sudo power-cap set --safe
+sudo power-cap set --cpu W [--cpu-pl2 W] --gpu W [--pause-thermald]
+sudo power-cap set --safe [--pause-thermald]
 sudo power-cap reset
 ```
 
@@ -244,8 +244,45 @@ sudo power-cap reset
   cap never outlives a reboot.
 - Every limit is read back after writing, and refusals are reported.
 - A permission error as root is reported as a firmware lock.
-- After a reset, `/run/power-cap` stays root-only, so unprivileged
-  `power-cap status` says "Cap: unknown" until reboot. Use sudo.
+- `/run/power-cap/applied.json` records the CPU limits power-cap holds in
+  place. Every `set` writes it: the limits that verified as applied, plus any
+  limit an earlier `set` recorded that a refused write left in place, or
+  `"zones": {}` when it holds none (all CPU writes refused, or a `--gpu`-only
+  `set` on a fresh state). A `--gpu`-only `set` keeps an existing record, and
+  writes none over the originals of an older power-cap (that CPU cap stays
+  unknown). A `reset` that restores everything removes it; a partial one keeps
+  only the CPU limits it could not restore, so a CPU fully restored reads as no
+  cap even while a GPU limit or thermald is still pending.
+- `/run/power-cap` is `0755` and `applied.json` is `0644`, because it holds
+  only limit values that sysfs already shows to everyone. `originals.json`
+  stays root-only (`0600`). So `power-cap status` and the monitor work without
+  sudo; only the thermald marker in `originals.json` needs sudo to be seen.
+  Every `set` that passes its argument checks sets the dir to `0755` before it
+  writes anything, so a dir left `0700` by an older power-cap opens up even
+  when every write is then refused; until then unprivileged `status` says
+  "Cap: unknown" and "CPU cap: unknown (record unreadable)".
+- `status` compares the record with the live limits (within 1 W, zone
+  enabled) and prints `CPU cap: applied, live limits match`, `reverted by
+  something else — intel-rapl:0 constraint_0 applied 45 W, now 91 W` (each
+  mismatch, plus a `--pause-thermald` hint when thermald is active), `none`
+  (a record of no zones, or no record and no originals), `unknown (cap set by
+  an older power-cap; ...)` (originals without a record), or `unknown (record
+  unreadable)` / `unknown (live limits unreadable)`. It is the same rule as
+  the monitor's `cpu_cap` below.
+- thermald may restore RAPL limits it manages. `set` prints a `warning:` line
+  when `thermald.service` is active and a CPU cap is written without
+  `--pause-thermald`. `status` prints `thermald: active (may restore RAPL
+  limits; see set --pause-thermald)`, `inactive (stopped by power-cap; reset
+  starts it again)`, `inactive` or `unknown` (systemctl unavailable).
+- `--pause-thermald` (with `--safe` or `--cpu`/`--gpu`), when thermald is active:
+  needs root, runs `systemctl --no-ask-password stop thermald.service` before
+  any limit is written, and records that in `originals.json`. A failed stop
+  is a failed result (exit 1); the caps are still applied. When thermald is
+  not active there is nothing to pause. `reset` then runs `systemctl start
+  thermald.service`, and only if power-cap stopped it; a failed start keeps
+  the originals, like any failed restore. thermald is never disabled or
+  masked, so a reboot starts it again and also drops the cap.
+- `$POWER_CAP_SYSTEMCTL` overrides the systemctl command.
 
 ## Data contract (public interface)
 
@@ -274,7 +311,7 @@ The dir holds `current.json`, `history-raw.jsonl`, `history-1m.jsonl` and
 ### current.json
 
 The latest sample: the `--once --json` report plus `interval_s`,
-`cpu_limit_w`, `gpu_max_limit_w` and `epoch`. After every sample it is written
+`cpu_limit_w`, `cpu_cap`, `cpu_cap_w`, `gpu_max_limit_w` and `epoch`. After every sample it is written
 complete to a temporary file in the same dir and renamed over the old one
 (`os.replace`), so a reader sees the old file or the new one, never a partial
 one, and a directory watch sees every update. It is a few hundred bytes; the
@@ -285,7 +322,7 @@ Numbers are JSON numbers (never strings). Measured and estimated watts and
 amps are rounded to 2 decimals and `battery_capacity` is a whole percent;
 `epoch` is not rounded (fractional seconds), and `cpu_limit_w` and the
 configured `adapter_v`, `adapter_rating_w` and `threshold_w` are written as
-read or configured. `null` means unknown or not applicable, as listed.
+read or configured, and `cpu_cap_w` as recorded. `null` means unknown or not applicable, as listed.
 
 | Key | Type | Meaning, unit | `null` when |
 |---|---|---|---|
@@ -315,10 +352,13 @@ read or configured. `null` means unknown or not applicable, as listed.
 | `adapter_current_a` | number | adapter current, A | voltage not configured, or on battery |
 | `threshold_w` | number | resolved alert threshold, W | never |
 | `cpu_limit_w` | number | CPU long-term limit (PL1), W | unreadable |
+| `cpu_cap` | string | `power-cap` CPU cap against the live limits, read from `$POWER_CAP_STATE_DIR` (default `/run/power-cap`) each sample: `capped` (every limit in `applied.json` within 1 W of the live one, zone enabled), `reverted` (a mismatch, a disabled or a missing zone), `uncapped` (`applied.json` records no zone, or neither `applied.json` nor `originals.json` exists) | cannot tell: `originals.json` without `applied.json` (only a cap by an older power-cap, which wrote no record, leaves that), a permission error, an oversized (over 64 KiB), non-regular or malformed `applied.json`, or a live limit unreadable |
+| `cpu_cap_w` | number | the recorded CPU long-term cap (PL1 in `applied.json`), summed over zones, W | no record read, or it holds no PL1 |
 | `errors` | array | read errors of this sample, strings | never (empty list) |
 
-The widget reads every key except `time`. It treats a value outside the listed
-values or types as not reported.
+The widget reads every key except `time`; `cpu_cap` and `cpu_cap_w` were added
+later, and a widget that predates them ignores them. It treats a value outside
+the listed values or types as not reported.
 
 ### History tiers
 
@@ -354,9 +394,10 @@ second `--quiet` instance from writing.
 
 ### Stability
 
-Additive changes are compatible: a new key in `current.json`, a new field in a
-history line, a new file in the state dir, a longer retention. Consumers ignore
-what they do not know. Renaming or removing a key, field or file, changing a
+Additive changes are compatible: a new key in `current.json` (as `cpu_cap` and
+`cpu_cap_w` were), a new field in a history line, a new file in the state dir, a
+longer retention. Consumers ignore what they do not know, so older consumers keep
+working. Renaming or removing a key, field or file, changing a
 JSON type or an enumerated value, changing the state dir resolution, giving up
 the atomic rename of `current.json`, or keeping a tier for less than the range
 the widget shows from it, is a breaking change for the widget.
@@ -404,7 +445,8 @@ python3 -m pytest -q tests/
 Needs only the standard library and pytest. `tests/test_contract.py` guards
 the [Data contract](#data-contract-public-interface) the bar widget reads. Fixtures are injected through
 `POWER_WATCH_SYSFS`, `POWER_WATCH_NVIDIA_SMI`, `POWER_WATCH_STATE_DIR`,
-`POWER_WATCH_NOTIFY` and `POWER_CAP_STATE_DIR`, so no root and no GPU are needed.
+`POWER_WATCH_NOTIFY`, `POWER_CAP_STATE_DIR` and `POWER_CAP_SYSTEMCTL`, so no root, no GPU
+and no real thermald are needed.
 
 ### Manual test plan
 
@@ -424,9 +466,15 @@ Compare each expectation with your own machine's specs.
 5. `sudo power-cap set --safe`. Read the per-limit report and note which writes
    were accepted. Confirm with `sudo power-cap status` and `nvidia-smi -q -d
    POWER`. Under load, CPU power should settle at or below the cap.
+   `power-cap status` (no sudo) shows "CPU cap: applied, live limits match".
+   If thermald is active, `set` warned about it; hours later `status` may show
+   "CPU cap: reverted by something else". Then `sudo power-cap set --safe
+   --pause-thermald` stops it first, and `systemctl is-active thermald` reads
+   `inactive`.
 6. Alert test: `power-watch --threshold 50 --sustain 4` under load, on AC. Expect
    one critical notification, not repeated within `--alert-every`.
-7. `sudo power-cap reset`. Expect your original limits back and "Cap: none".
+7. `sudo power-cap reset`. Expect your original limits back, "Cap: none", and
+   thermald active again if `--pause-thermald` stopped it.
 8. `./install.sh --user` in a terminal. Expect `systemctl --user status
    power-watch` active, no warnings, and with Omarchy the offer to add the bar
    widget (omarchy asks you to confirm). Run it again: the widget is reported

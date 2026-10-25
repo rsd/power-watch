@@ -46,6 +46,34 @@ case "$(cat "$d/mode")" in
 esac
 """
 
+# Fake systemctl: argv lines in systemctl-state/calls (one argument per field, tab-separated),
+# thermald state in systemctl-state/thermald (active | inactive). stop_fail / start_fail make
+# that verb fail; stop_noop leaves thermald active. stop records PL1 at that moment.
+FAKE_SYSTEMCTL = r"""#!/bin/sh
+d="$(dirname "$0")/systemctl-state"
+(IFS="$(printf '\t')"; echo "$*") >> "$d/calls"
+verb=""
+for a in "$@"; do case "$a" in --*) ;; *) verb=$a; break ;; esac; done
+case "$verb" in
+  is-active)
+    state="$(cat "$d/thermald")"; echo "$state"
+    [ "$state" = active ] && exit 0; exit 3 ;;
+  stop)
+    cat "$POWER_WATCH_SYSFS/class/powercap/intel-rapl:0/constraint_0_power_limit_uw" \
+      >> "$d/pl1_at_stop"
+    if [ -f "$d/stop_fail" ]; then
+      echo "Failed to stop thermald.service: Access denied" >&2; exit 1
+    fi
+    [ -f "$d/stop_noop" ] || echo inactive > "$d/thermald"; exit 0 ;;
+  start)
+    if [ -f "$d/start_fail" ]; then
+      echo "Job for thermald.service failed." >&2; exit 1
+    fi
+    echo active > "$d/thermald"; exit 0 ;;
+esac
+exit 1
+"""
+
 
 class Env:
     def __init__(self, tmp_path, monkeypatch):
@@ -54,6 +82,8 @@ class Env:
         self.state = tmp_path / "run" / "power-cap"
         self.smi = tmp_path / "nvidia-smi"
         self.smi_state = tmp_path / "smi-state"
+        self.systemctl = tmp_path / "systemctl"
+        self.sc_state = tmp_path / "systemctl-state"
         files = {
             "name": "package-0", "enabled": "1", "energy_uj": "123456",
             "max_energy_range_uj": "262143328850",
@@ -76,10 +106,15 @@ class Env:
         self.smi.chmod(0o755)
         self.smi_state.mkdir()
         self.set_gpu(limit="190.00", mode="accept")
+        self.systemctl.write_text(FAKE_SYSTEMCTL)
+        self.systemctl.chmod(0o755)
+        self.sc_state.mkdir()
+        self.thermald("inactive")
         # no config file: XDG_CONFIG_HOME points at an empty dir, never the real ~/.config
         self.config_home = tmp_path / "xdg"
         self.vars = {"POWER_WATCH_SYSFS": str(self.root), "POWER_WATCH_NVIDIA_SMI": str(self.smi),
                      "POWER_CAP_STATE_DIR": str(self.state),
+                     "POWER_CAP_SYSTEMCTL": str(self.systemctl),
                      "XDG_CONFIG_HOME": str(self.config_home)}
         for k, v in self.vars.items():
             monkeypatch.setenv(k, v)
@@ -119,6 +154,25 @@ class Env:
 
     def originals(self):
         return json.loads((self.state / "originals.json").read_text())
+
+    def applied(self):
+        return json.loads((self.state / "applied.json").read_text())
+
+    def thermald(self, state=None):
+        """Set the fake thermald state; return the current one."""
+        if state is not None:
+            (self.sc_state / "thermald").write_text(state + "\n")
+        return (self.sc_state / "thermald").read_text().strip()
+
+    def sc_flag(self, name):
+        (self.sc_state / name).write_text("")
+
+    def sc_calls(self):
+        p = self.sc_state / "calls"
+        return [line.split("\t") for line in p.read_text().splitlines()] if p.exists() else []
+
+    def sc_verbs(self):
+        return [c for c in self.sc_calls() if c != ["is-active", "thermald.service"]]
 
     def config(self, text, path=None):
         """Write a config file (default: the XDG location) and return its path."""
@@ -251,7 +305,15 @@ def test_set_saves_originals_with_safe_modes(env, capsys):
         "zones": {"intel-rapl:0": {"constraint_0_power_limit_uw": 91000000,
                                    "constraint_1_power_limit_uw": 0, "enabled": 1}},
         "gpu": {"enforced_limit_w": 190.0}}
-    assert stat.S_IMODE(env.state.stat().st_mode) == 0o700
+    assert stat.S_IMODE(env.state.stat().st_mode) == 0o755
+    assert stat.S_IMODE((env.state / "originals.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((env.state / "applied.json").stat().st_mode) == 0o644
+
+
+def test_set_opens_an_old_0700_state_dir_to_0755(env, capsys):
+    env.state.mkdir(parents=True, mode=0o700)       # left by an older power-cap
+    assert run(capsys, "set", "--cpu", "50")[0] == 0
+    assert stat.S_IMODE(env.state.stat().st_mode) == 0o755
     assert stat.S_IMODE((env.state / "originals.json").stat().st_mode) == 0o600
 
 
@@ -975,3 +1037,562 @@ def test_env_int_rejects_out_of_range_ids(monkeypatch, raw):
 def test_env_int_accepts_valid_id(monkeypatch):
     monkeypatch.setenv("SUDO_UID", "1000")
     assert pc._env_int("SUDO_UID") == 1000
+
+
+# --- thermald: warning, --pause-thermald, reset ---------------------------------
+
+STOP = ["--no-ask-password", "stop", "thermald.service"]
+START = ["--no-ask-password", "start", "thermald.service"]
+WARNING = ("warning: thermald.service is active and may restore the RAPL limits; "
+           "add --pause-thermald to stop it until `reset`")
+
+
+@pytest.fixture
+def as_root(monkeypatch):
+    """Pretend to be root where power-cap checks it (no identity switch happens here)."""
+    monkeypatch.setattr(pc, "geteuid", lambda: 0)
+
+
+@pytest.mark.parametrize("argv", [["--safe"], ["--cpu", "45"]])
+def test_set_warns_when_thermald_is_active_and_never_stops_it(env, capsys, argv):
+    env.thermald("active")
+    code, out, _ = run(capsys, "set", *argv)
+    assert code == 0, out
+    assert out.count("warning:") == 1 and WARNING in out
+    assert env.sc_calls() == [["is-active", "thermald.service"]]
+    assert env.thermald() == "active"
+    assert "thermald_stopped" not in env.originals()
+
+
+def test_set_without_thermald_or_cpu_asks_nothing(env, capsys):
+    assert "warning" not in run(capsys, "set", "--cpu", "45")[1]       # inactive: no warning
+    before = len(env.sc_calls())
+    env.thermald("active")
+    code, out, _ = run(capsys, "set", "--gpu", "80")                  # GPU only: not RAPL
+    assert code == 0 and "warning" not in out
+    assert len(env.sc_calls()) == before
+
+
+@pytest.mark.parametrize("argv", [["--safe"], ["--cpu", "45", "--gpu", "80"]])
+def test_pause_thermald_stops_it_before_any_rapl_write(env, capsys, as_root, argv):
+    env.thermald("active")
+    code, out, _ = run(capsys, "set", *argv, "--pause-thermald")
+    assert code == 0, out
+    assert "warning" not in out
+    assert env.sc_verbs() == [STOP]
+    assert env.sc_calls() == [["is-active", "thermald.service"], STOP,
+                              ["is-active", "thermald.service"]]
+    assert (env.sc_state / "pl1_at_stop").read_text().split() == ["91000000"]   # not yet written
+    assert env.read("constraint_0_power_limit_uw") != "91000000"
+    assert "  thermald.service: stopped (reset starts it again)" in out
+    assert out.index("thermald.service: stopped") < out.index("constraint_0")
+    assert env.originals()["thermald_stopped"] is True
+    assert env.originals()["zones"]["intel-rapl:0"]["constraint_0_power_limit_uw"] == 91000000
+    assert stat.S_IMODE((env.state / "originals.json").stat().st_mode) == 0o600
+
+
+def test_pause_thermald_marker_survives_a_second_set_and_reset_starts_it(env, capsys, as_root):
+    env.thermald("active")
+    assert run(capsys, "set", "--safe", "--pause-thermald")[0] == 0
+    code, out, _ = run(capsys, "set", "--cpu", "40", "--pause-thermald")
+    assert code == 0 and "nothing to pause (stopped by power-cap earlier)" in out
+    assert env.originals()["thermald_stopped"] is True
+    assert env.sc_verbs() == [STOP]
+    code, out, _ = run(capsys, "reset")
+    assert code == 0, out
+    assert "  thermald.service: started again" in out
+    assert env.sc_verbs() == [STOP, START]
+    assert env.thermald() == "active"
+    assert not (env.state / "originals.json").exists()
+    assert env.read("constraint_0_power_limit_uw") == "91000000"
+
+
+def test_pause_thermald_when_inactive_writes_no_marker_and_reset_never_starts(env, capsys):
+    code, out, _ = run(capsys, "set", "--cpu", "45", "--pause-thermald")    # no root needed
+    assert code == 0, out
+    assert "  thermald.service: not active, nothing to pause" in out
+    assert "thermald_stopped" not in env.originals()
+    code, out, _ = run(capsys, "reset")
+    assert code == 0 and "thermald" not in out
+    assert env.sc_verbs() == []
+    assert env.thermald() == "inactive"
+
+
+def test_reset_never_starts_a_thermald_power_cap_did_not_stop(env, capsys):
+    env.thermald("active")
+    assert run(capsys, "set", "--cpu", "45")[0] == 0                         # warned only
+    env.thermald("inactive")                                                 # stopped by hand
+    assert run(capsys, "reset")[0] == 0
+    assert env.sc_verbs() == [] and env.thermald() == "inactive"
+
+
+def test_pause_thermald_as_user_needs_root_and_changes_nothing(env, capsys):
+    if os.geteuid() == 0:
+        pytest.skip("real root")
+    env.thermald("active")
+    code, _, err = run(capsys, "set", "--safe", "--pause-thermald")
+    assert code == 1
+    assert ("power-cap: needs root: run sudo power-cap set --safe --pause-thermald "
+            "(stopping thermald.service needs root)") in err
+    assert env.sc_verbs() == []
+    assert env.read("constraint_0_power_limit_uw") == "91000000"
+    assert not (env.state / "originals.json").exists()
+
+
+@pytest.mark.parametrize("flag, msg", [
+    ("stop_fail", "not stopped: systemctl error: Failed to stop thermald.service: Access denied"),
+    ("stop_noop", "not stopped: still active after systemctl stop"),
+])
+def test_failed_stop_is_a_failed_result_and_caps_still_apply(env, capsys, as_root, flag, msg):
+    env.thermald("active")
+    env.sc_flag(flag)
+    code, out, _ = run(capsys, "set", "--cpu", "45", "--pause-thermald")
+    assert code == 1
+    assert f"  thermald.service: {msg}" in out
+    assert env.read("constraint_0_power_limit_uw") == "45000000"
+    assert "intel-rapl:0 constraint_0 45 W: applied" in out
+    assert "thermald_stopped" not in env.originals()
+    assert run(capsys, "reset")[0] == 0
+    assert START not in env.sc_calls()
+
+
+def test_failed_start_on_reset_keeps_originals(env, capsys, as_root):
+    env.thermald("active")
+    assert run(capsys, "set", "--cpu", "45", "--pause-thermald")[0] == 0
+    env.sc_flag("start_fail")
+    code, out, _ = run(capsys, "reset")
+    assert code == 1
+    assert "  thermald.service: not started: systemctl error: Job for thermald.service failed." in out
+    assert env.read("constraint_0_power_limit_uw") == "91000000"         # limits still restored
+    assert env.originals()["thermald_stopped"] is True
+    (env.sc_state / "start_fail").unlink()
+    assert run(capsys, "reset")[0] == 0
+    assert env.thermald() == "active"
+
+
+def test_marker_only_originals_are_resettable(env, capsys):
+    env.state.mkdir(parents=True)
+    (env.state / "originals.json").write_text('{"thermald_stopped": true}')
+    assert pc.has_originals({"thermald_stopped": True})
+    assert not pc.has_originals({"thermald_stopped": False})
+    assert "Cap: active" in run(capsys, "status")[1]
+    code, out, _ = run(capsys, "reset")
+    assert code == 0, out
+    assert env.sc_verbs() == [START]
+    assert not (env.state / "originals.json").exists()
+
+
+def test_missing_systemctl_is_unknown_without_warning_or_crash(env, capsys, monkeypatch, as_root):
+    monkeypatch.setenv("POWER_CAP_SYSTEMCTL", str(env.systemctl.parent / "missing-systemctl"))
+    assert pc.thermald_state() == "unknown"
+    code, out, _ = run(capsys, "set", "--cpu", "45")
+    assert code == 0 and "warning" not in out
+    code, out, _ = run(capsys, "set", "--cpu", "45", "--pause-thermald")
+    assert code == 0, out
+    assert "thermald.service: state unknown (systemctl unavailable); nothing paused" in out
+    assert "thermald_stopped" not in env.originals()
+    assert "thermald: unknown" in run(capsys, "status")[1]
+
+
+def test_systemctl_timeout_and_os_error_are_unknown(monkeypatch):
+    def timeout(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+    def oserror(cmd, **kw):
+        raise PermissionError(13, "Permission denied")
+
+    for fake in (timeout, oserror):
+        monkeypatch.setattr(pc.subprocess, "run", fake)
+        assert pc.thermald_state() == "unknown"
+
+
+@pytest.mark.parametrize("stdout, state", [("active\n", "active"), ("inactive\n", "inactive"),
+                                           ("failed\n", "inactive"), ("activating\n", "inactive"),
+                                           ("", "unknown")])
+def test_thermald_state_from_is_active_output(monkeypatch, stdout, state):
+    monkeypatch.setattr(pc.subprocess, "run",
+                        lambda cmd, **kw: SimpleNamespace(returncode=0, stdout=stdout, stderr=""))
+    assert pc.thermald_state() == state
+
+
+def test_systemctl_runs_as_an_argv_list_without_a_shell(monkeypatch):
+    monkeypatch.setenv("POWER_CAP_SYSTEMCTL", "/usr/bin/systemctl --quiet-test")
+    calls = []
+
+    def fake(cmd, **kw):
+        calls.append((cmd, kw))
+        return SimpleNamespace(returncode=0, stdout="inactive\n", stderr="")
+
+    monkeypatch.setattr(pc.subprocess, "run", fake)
+    assert pc.stop_thermald() == (True, "stopped (reset starts it again)")
+    assert pc.start_thermald() == (True, "started again")
+    assert [c for c, _ in calls] == [
+        ["/usr/bin/systemctl", "--quiet-test", *STOP],
+        ["/usr/bin/systemctl", "--quiet-test", "is-active", "thermald.service"],
+        ["/usr/bin/systemctl", "--quiet-test", *START]]
+    for cmd, kw in calls:
+        assert isinstance(cmd, list) and "shell" not in kw and kw["capture_output"] is True
+    assert [kw["timeout"] for _, kw in calls] == [30, 5, 30]
+    assert not any(v in c for c, _ in calls for v in ("disable", "mask"))
+
+
+def test_help_names_pause_thermald(env):
+    r = subprocess.run([str(SCRIPT), "set", "--help"], capture_output=True, text=True, check=False)
+    assert r.returncode == 0 and "--pause-thermald" in r.stdout
+
+
+# --- applied record and drift ------------------------------------------------
+
+def test_set_records_only_verified_cpu_limits(env, capsys, monkeypatch):
+    real = pc.write_sysfs
+
+    def clamp(path, value):     # firmware keeps PL1 at 91 W
+        if Path(path).name == "constraint_0_power_limit_uw":
+            value = 91000000
+        return real(path, value)
+
+    monkeypatch.setattr(pc, "write_sysfs", clamp)
+    assert run(capsys, "set", "--cpu", "45")[0] == 1
+    rec = env.applied()
+    assert rec["zones"] == {"intel-rapl:0": {"constraint_1_power_limit_uw": 45000000}}
+    assert isinstance(rec["time"], float)
+
+
+def test_set_with_every_cpu_write_refused_on_fresh_state_records_none(env, capsys, monkeypatch):
+    monkeypatch.setattr(pc, "write_sysfs", lambda p, v: "write failed: Input/output error")
+    assert run(capsys, "set", "--cpu", "45")[0] == 1
+    assert env.applied()["zones"] == {}
+    assert "CPU cap: none\n" in run(capsys, "status")[1]
+    from test_power_watch import pw
+    assert pw.read_cpu_cap(env.root) == ("uncapped", None)
+
+
+def test_set_with_every_cpu_write_refused_keeps_the_limits_still_in_place(env, capsys,
+                                                                          monkeypatch):
+    assert run(capsys, "set", "--cpu", "50")[0] == 0
+    first = env.applied()["zones"]
+    monkeypatch.setattr(pc, "write_sysfs", lambda p, v: "write failed: Input/output error")
+    assert run(capsys, "set", "--cpu", "45")[0] == 1
+    assert env.applied()["zones"] == first                      # the 50 W cap still holds
+    assert "CPU cap: applied, live limits match" in run(capsys, "status")[1]
+
+
+def test_set_with_all_cpu_writes_failing_opens_an_old_0700_dir(env, capsys, monkeypatch):
+    env.state.mkdir(parents=True, mode=0o700)
+    (env.state / "originals.json").write_text('{"gpu": {"enforced_limit_w": 190.0}}')
+    monkeypatch.setattr(pc, "write_sysfs", lambda p, v: "write failed: Input/output error")
+    assert run(capsys, "set", "--cpu", "45")[0] == 1
+    assert stat.S_IMODE(env.state.stat().st_mode) == 0o755
+    assert stat.S_IMODE((env.state / "applied.json").stat().st_mode) == 0o644
+
+
+def test_gpu_only_set_opens_an_old_0700_dir(env, capsys):
+    env.state.mkdir(parents=True, mode=0o700)
+    (env.state / "originals.json").write_text('{"gpu": {"enforced_limit_w": 190.0}}')
+    assert run(capsys, "set", "--gpu", "190")[0] == 0           # originals unchanged
+    assert stat.S_IMODE(env.state.stat().st_mode) == 0o755
+
+
+def test_failed_enable_leaves_the_zone_out_of_the_record(env, capsys, monkeypatch):
+    env.write("enabled", "0")
+    real = pc.write_sysfs
+    monkeypatch.setattr(pc, "write_sysfs",
+                        lambda p, v: None if Path(p).name == "enabled" else real(p, v))
+    assert run(capsys, "set", "--cpu", "45")[0] == 1
+    assert env.applied()["zones"] == {}
+
+
+def test_gpu_only_set_on_fresh_state_records_no_cpu_cap(env, capsys):
+    assert run(capsys, "set", "--gpu", "80")[0] == 0
+    assert "gpu" in env.originals()
+    assert env.applied()["zones"] == {}
+    assert stat.S_IMODE((env.state / "applied.json").stat().st_mode) == 0o644
+    assert "CPU cap: none\n" in run(capsys, "status")[1]
+    from test_power_watch import pw
+    assert pw.read_cpu_cap(env.root) == ("uncapped", None)
+    assert run(capsys, "set", "--gpu", "70")[0] == 0           # a second one keeps it
+    assert env.applied()["zones"] == {}
+    assert run(capsys, "reset")[0] == 0
+    assert not (env.state / "applied.json").exists()
+
+
+def test_gpu_only_set_over_an_older_power_cap_cap_writes_no_record(env, capsys):
+    env.state.mkdir(parents=True, mode=0o700)                    # an older power-cap's dir
+    (env.state / "originals.json").write_text(json.dumps(
+        {"zones": {"intel-rapl:0": {"constraint_0_power_limit_uw": 91000000}},
+         "gpu": {"enforced_limit_w": 190.0}}))
+    assert run(capsys, "set", "--gpu", "80")[0] == 0              # writes no state file
+    assert not (env.state / "applied.json").exists()            # that CPU cap stays unknown
+    assert stat.S_IMODE(env.state.stat().st_mode) == 0o755      # yet the dir is opened
+    assert pc.OLDER_CAP_LINE in run(capsys, "status")[1]
+
+
+def test_gpu_only_set_keeps_the_cpu_record_and_a_cpu_set_replaces_it(env, capsys):
+    assert run(capsys, "set", "--cpu", "50")[0] == 0
+    first = env.applied()
+    assert run(capsys, "set", "--gpu", "80")[0] == 0
+    assert env.applied() == first
+    assert run(capsys, "set", "--cpu", "45", "--cpu-pl2", "60")[0] == 0
+    assert env.applied()["zones"] == {"intel-rapl:0": {"constraint_0_power_limit_uw": 45000000,
+                                                       "constraint_1_power_limit_uw": 60000000}}
+
+
+def test_reset_removes_the_record_also_with_nothing_to_reset(env, capsys):
+    assert run(capsys, "set", "--cpu", "50")[0] == 0
+    assert run(capsys, "reset")[0] == 0
+    assert not (env.state / "applied.json").exists()
+    (env.state / "applied.json").write_text('{"zones": {}}')        # stray record, no originals
+    code, out, _ = run(capsys, "reset")
+    assert code == 0 and "nothing to reset" in out
+    assert not (env.state / "applied.json").exists()
+
+
+def test_reset_with_gpu_restore_failing_after_the_cpu_restored_is_uncapped(env, capsys):
+    from test_power_watch import pw
+    assert run(capsys, "set", "--cpu", "45", "--gpu", "80")[0] == 0
+    env.gpu_runtime("suspended")
+    code, out, _ = run(capsys, "reset")
+    assert code == 1 and "originals kept" in out
+    assert env.read("constraint_0_power_limit_uw") == "91000000"
+    assert env.applied()["zones"] == {}
+    assert pw.read_cpu_cap(env.root) == ("uncapped", None)
+    out = run(capsys, "status")[1]
+    assert "CPU cap: none\n" in out and "Cap: active" in out
+    env.gpu_runtime("active")
+    assert run(capsys, "reset")[0] == 0
+    assert not (env.state / "applied.json").exists()
+    assert not (env.state / "originals.json").exists()
+
+
+def test_reset_with_thermald_start_failing_after_the_cpu_restored_is_uncapped(env, capsys,
+                                                                             as_root):
+    from test_power_watch import pw
+    env.thermald("active")
+    assert run(capsys, "set", "--cpu", "45", "--pause-thermald")[0] == 0
+    env.sc_flag("start_fail")
+    assert run(capsys, "reset")[0] == 1
+    assert env.applied()["zones"] == {}
+    assert pw.read_cpu_cap(env.root) == ("uncapped", None)
+    assert "CPU cap: none\n" in run(capsys, "status")[1]
+
+
+def test_reset_with_a_cpu_restore_failing_keeps_that_limit_recorded(env, capsys, monkeypatch):
+    from test_power_watch import pw
+    assert run(capsys, "set", "--cpu", "45", "--cpu-pl2", "60")[0] == 0
+    real = pc.write_sysfs
+    monkeypatch.setattr(pc, "write_sysfs", lambda p, v: (
+        "write failed: Input/output error" if Path(p).name == "constraint_0_power_limit_uw"
+        else real(p, v)))
+    code, out, _ = run(capsys, "reset")
+    assert code == 1
+    assert env.read("constraint_0_power_limit_uw") == "45000000"     # still capped
+    assert env.read("constraint_1_power_limit_uw") == "0"            # restored
+    assert env.applied()["zones"] == {"intel-rapl:0": {"constraint_0_power_limit_uw": 45000000}}
+    assert pw.read_cpu_cap(env.root) == ("capped", 45.0)
+    assert "CPU cap: applied, live limits match" in run(capsys, "status")[1]
+    monkeypatch.setattr(pc, "write_sysfs", real)
+    assert run(capsys, "reset")[0] == 0
+    assert not (env.state / "applied.json").exists()
+    assert pw.read_cpu_cap(env.root) == ("uncapped", None)
+
+
+def test_reset_of_an_older_power_cap_cap(env, capsys, monkeypatch):
+    """No record (an older power-cap): a CPU restore failing leaves it unknown, a GPU one alone
+    records that the CPU is restored."""
+    from test_power_watch import pw
+    env.state.mkdir(parents=True)
+    env.write("constraint_0_power_limit_uw", "45000000")
+    (env.state / "originals.json").write_text(json.dumps(
+        {"zones": {"intel-rapl:0": {"constraint_0_power_limit_uw": 91000000}},
+         "gpu": {"enforced_limit_w": 190.0}}))
+    env.gpu_runtime("suspended")
+    real = pc.write_sysfs
+    monkeypatch.setattr(pc, "write_sysfs", lambda p, v: "write failed: Input/output error")
+    assert run(capsys, "reset")[0] == 1
+    assert not (env.state / "applied.json").exists()
+    assert pw.read_cpu_cap(env.root) == (None, None)
+    assert pc.OLDER_CAP_LINE in run(capsys, "status")[1]
+    monkeypatch.setattr(pc, "write_sysfs", real)
+    assert run(capsys, "reset")[0] == 1                             # GPU still suspended
+    assert env.applied()["zones"] == {}
+    assert pw.read_cpu_cap(env.root) == ("uncapped", None)
+
+
+def test_status_cpu_cap_none_for_a_record_of_no_zones(env, capsys):
+    env.state.mkdir(parents=True)
+    (env.state / "applied.json").write_text('{"zones": {}, "time": 1.0}')
+    (env.state / "originals.json").write_text('{"gpu": {"enforced_limit_w": 190.0}}')
+    assert pc.load_applied() == {"zones": {}, "time": 1.0}
+    assert "CPU cap: none\n" in run(capsys, "status")[1]
+
+
+def test_status_cpu_cap_unknown_for_a_cap_by_an_older_power_cap(env, capsys):
+    """originals.json without applied.json: only an older power-cap leaves that."""
+    env.state.mkdir(parents=True)
+    (env.state / "originals.json").write_text(json.dumps(
+        {"zones": {"intel-rapl:0": {"constraint_0_power_limit_uw": 91000000}}}))
+    out = run(capsys, "status")[1]
+    assert ("CPU cap: unknown (cap set by an older power-cap; `sudo power-cap reset` "
+            "clears it)\n") in out
+
+
+# The monitor's cpu_cap (bin/power-watch read_cpu_cap) and status's 'CPU cap:' line follow one
+# rule (duplicated in both scripts); this table holds them together over the same fixtures.
+STATUS_FOR_CPU_CAP = {"capped": "CPU cap: applied", "reverted": "CPU cap: reverted",
+                      "uncapped": "CPU cap: none", None: "CPU cap: unknown"}
+
+
+def _fixture(env, name):
+    rec = {"zones": {"intel-rapl:0": {"constraint_0_power_limit_uw": 45000000}}, "time": 1.0}
+    env.state.mkdir(parents=True)
+    if name == "no-state":
+        pass
+    elif name in ("capped", "reverted", "live-unreadable"):
+        env.write("constraint_0_power_limit_uw", 45000000 if name != "reverted" else 91000000)
+        if name == "live-unreadable":
+            (env.zone / "constraint_0_power_limit_uw").unlink()
+        (env.state / "applied.json").write_text(json.dumps(rec))
+        (env.state / "originals.json").write_text("{}")
+    elif name == "zone-gone":
+        rec["zones"] = {"intel-rapl:5": rec["zones"]["intel-rapl:0"]}
+        (env.state / "applied.json").write_text(json.dumps(rec))
+    elif name in ("no-zones", "no-zones-with-originals"):
+        (env.state / "applied.json").write_text('{"zones": {}}')
+        if name == "no-zones-with-originals":
+            (env.state / "originals.json").write_text("{}")
+    elif name == "older-power-cap":
+        (env.state / "originals.json").write_text("{}")
+    elif name == "malformed":
+        (env.state / "applied.json").write_text('{"zones": []}')
+    elif name == "stray-record-no-originals":
+        (env.state / "applied.json").write_text(json.dumps(rec))
+        env.write("constraint_0_power_limit_uw", 45000000)
+
+
+@pytest.mark.parametrize("name, cpu_cap", [
+    ("no-state", "uncapped"), ("capped", "capped"), ("reverted", "reverted"),
+    ("live-unreadable", None), ("zone-gone", "reverted"), ("no-zones", "uncapped"),
+    ("no-zones-with-originals", "uncapped"), ("older-power-cap", None), ("malformed", None),
+    ("stray-record-no-originals", "capped"),
+])
+def test_status_and_monitor_agree_on_the_cpu_cap(env, capsys, name, cpu_cap):
+    from test_power_watch import pw
+    _fixture(env, name)
+    assert pw.read_cpu_cap(env.root)[0] == cpu_cap
+    line = next(x for x in run(capsys, "status")[1].splitlines() if x.startswith("CPU cap:"))
+    assert line.startswith(STATUS_FOR_CPU_CAP[cpu_cap]), line
+
+
+def test_status_cpu_cap_applied_and_none(env, capsys):
+    out = run(capsys, "status")[1]
+    assert "CPU cap: none\n" in out and "thermald: inactive\n" in out
+    assert run(capsys, "set", "--safe")[0] == 0
+    out = run(capsys, "status")[1]
+    assert "CPU cap: applied, live limits match\n" in out
+
+
+def test_status_cpu_cap_within_tolerance_matches(env, capsys):
+    assert run(capsys, "set", "--cpu", "45")[0] == 0
+    env.write("constraint_0_power_limit_uw", "45999000")          # RAPL unit rounding
+    assert "CPU cap: applied, live limits match" in run(capsys, "status")[1]
+
+
+def test_status_cpu_cap_reverted_lists_each_mismatch(env, capsys):
+    assert run(capsys, "set", "--cpu", "45")[0] == 0
+    env.write("constraint_0_power_limit_uw", "91000000")          # as seen on nostromo
+    out = run(capsys, "status")[1]
+    assert ("CPU cap: reverted by something else — intel-rapl:0 constraint_0 applied 45 W, "
+            "now 91 W\n") in out
+    env.write("constraint_1_power_limit_uw", "0")
+    env.write("enabled", "0")
+    out = run(capsys, "status")[1]
+    assert ("reverted by something else — intel-rapl:0 constraint_0 applied 45 W, now 91 W; "
+            "intel-rapl:0 constraint_1 applied 45 W, now 0 W; intel-rapl:0 disabled") in out
+    assert "--pause-thermald" not in out.split("CPU cap:")[1].splitlines()[0]
+
+
+def test_status_reverted_with_thermald_active_hints_pause(env, capsys, as_root):
+    assert run(capsys, "set", "--cpu", "45")[0] == 0
+    env.write("constraint_0_power_limit_uw", "91000000")
+    env.thermald("active")
+    out = run(capsys, "status")[1]
+    line = next(x for x in out.splitlines() if x.startswith("CPU cap:"))
+    assert "reverted by something else" in line and "--pause-thermald" in line
+    assert "thermald: active (may restore RAPL limits; see set --pause-thermald)" in out
+
+
+def test_status_missing_zone_is_reverted(env, capsys):
+    assert run(capsys, "set", "--cpu", "45")[0] == 0
+    rec = env.applied()
+    rec["zones"]["intel-rapl:1"] = {"constraint_0_power_limit_uw": 45000000}
+    (env.state / "applied.json").write_text(json.dumps(rec))
+    assert "CPU cap: reverted by something else — intel-rapl:1 gone" in run(capsys, "status")[1]
+
+
+def test_status_live_limit_unreadable_is_unknown(env, capsys):
+    assert run(capsys, "set", "--cpu", "45")[0] == 0
+    (env.zone / "constraint_1_power_limit_uw").unlink()
+    assert "CPU cap: unknown (live limits unreadable)" in run(capsys, "status")[1]
+
+
+@pytest.mark.parametrize("content", [
+    "{not json", "[]", '{"zones": []}',
+    '{"zones": {"../etc": {"constraint_0_power_limit_uw": 1}}}',
+    '{"zones": {"intel-rapl:0": {"constraint_0_power_limit_uw": "45"}}}',
+    '{"zones": {"intel-rapl:0": {"constraint_0_power_limit_uw": true}}}',
+    '{"zones": {"intel-rapl:0": {"energy_uj": 1}}}', '{"zones": {"intel-rapl:0": {}}}',
+    "{}" + " " * (64 * 1024),
+])
+def test_status_unreadable_record(env, capsys, content):
+    env.state.mkdir(parents=True)
+    (env.state / "applied.json").write_text(content)
+    code, out, _ = run(capsys, "status")
+    assert code == 0
+    assert "CPU cap: unknown (record unreadable)" in out
+
+
+def test_status_record_not_a_regular_file(env, capsys):
+    env.state.mkdir(parents=True)
+    os.mkfifo(env.state / "applied.json")       # a blocking open would hang here
+    assert "CPU cap: unknown (record unreadable)" in run(capsys, "status")[1]
+
+
+def test_status_record_permission_denied(env, capsys):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file modes")
+    assert run(capsys, "set", "--cpu", "45")[0] == 0
+    (env.state / "applied.json").chmod(0o000)
+    assert "CPU cap: unknown (record unreadable)" in run(capsys, "status")[1]
+
+
+def test_status_as_user_reads_the_record_but_not_the_marker(env, capsys, monkeypatch):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file modes")
+    monkeypatch.setattr(pc, "geteuid", lambda: 0)
+    env.thermald("active")
+    assert run(capsys, "set", "--cpu", "45", "--pause-thermald")[0] == 0
+    monkeypatch.setattr(pc, "geteuid", lambda: 1000)
+    out = run(capsys, "status")[1]
+    assert "thermald: inactive (stopped by power-cap; reset starts it again)" in out
+    (env.state / "originals.json").chmod(0o000)          # what a user sees of the 0600 file
+    try:
+        out = run(capsys, "status")[1]
+    finally:
+        (env.state / "originals.json").chmod(0o600)
+    assert "CPU cap: applied, live limits match" in out
+    assert "thermald: inactive\n" in out
+    assert "Cap: active" in out
+
+
+def test_power_watch_reads_the_record_power_cap_writes(env, capsys):
+    """The drift rule is duplicated in bin/power-watch (read_cpu_cap): both scripts agree on
+    the real record."""
+    from test_power_watch import pw
+    assert pw.read_cpu_cap(env.root) == ("uncapped", None)
+    assert run(capsys, "set", "--safe")[0] == 0
+    assert pw.read_cpu_cap(env.root) == ("capped", 46.0)
+    env.write("constraint_0_power_limit_uw", "91000000")
+    assert pw.read_cpu_cap(env.root) == ("reverted", 46.0)
+    assert "reverted by something else" in run(capsys, "status")[1]
+    assert run(capsys, "reset")[0] == 0
+    assert pw.read_cpu_cap(env.root) == ("uncapped", None)

@@ -151,9 +151,11 @@ class FakeClock:
 
 @pytest.fixture(autouse=True)
 def no_user_config(tmp_path, monkeypatch):
-    """Never read the real ~/.config/power-watch/config or $POWER_WATCH_CONFIG."""
+    """Never read the real ~/.config/power-watch/config, $POWER_WATCH_CONFIG or power-cap's
+    /run/power-cap (an absent power-cap state dir: cpu_cap "uncapped")."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.delenv("POWER_WATCH_CONFIG", raising=False)
+    monkeypatch.setenv("POWER_CAP_STATE_DIR", str(tmp_path / "no-power-cap"))
 
 
 @pytest.fixture
@@ -325,6 +327,17 @@ def test_model_on_ac_default_rest():
     assert r["adapter_current_a"] == pytest.approx(round(71.7 / 19.5, 2))
     assert pw.rest_sample(r) is None
     assert "DEFAULT — run `power-watch calibrate`" in pw.render(r)
+
+
+@pytest.mark.parametrize("source, label", [
+    ("default", "DEFAULT — run `power-watch calibrate`"), ("calibrate", "calibrated"),
+    ("passive", "passively calibrated"), ("something-new", "something-new")])
+def test_render_rest_label_words_the_rest_source(source, label):
+    r = pw.model(sample(), pw.Calibration(18.0, source), CFG)
+    assert r["rest_source"] == source                          # the contract value is unchanged
+    line = next(x for x in pw.render(r).splitlines() if x.startswith("Rest"))
+    assert line.endswith(f"({label})")
+    assert "calibrate calibration" not in pw.render(r)
 
 
 def test_model_on_ac_charging_adds_battery_power():
@@ -1221,3 +1234,165 @@ def test_once_json_with_owner_config_matches_old_values(tmp_path, monkeypatch, c
     assert (r["total_source"], r["total_lower_bound"], r["psys_w"], r["gpu_status"]) == (
         "model", False, None, "active")
     assert r["adapter_current_a"] == pytest.approx(round(r["total_w"] / 19.5, 2))
+
+
+# ------------------------------------------------- cpu_cap (power-cap's applied.json)
+
+def cap_dir(tmp_path, applied=None, originals=False):
+    """A power-cap state dir: applied.json (dict -> JSON, str as is) and/or originals.json."""
+    d = tmp_path / "run-power-cap"
+    d.mkdir(exist_ok=True)
+    if applied is not None:
+        (d / "applied.json").write_text(applied if isinstance(applied, str) else json.dumps(applied))
+    if originals:
+        (d / "originals.json").write_text("{}")
+    return d
+
+
+def record(**zones):
+    """applied.json content; zone keyword intel_rapl_N names zone intel-rapl:N."""
+    return {"zones": {"intel-rapl:" + name.rsplit("_", 1)[1]: entry
+                      for name, entry in zones.items()}, "time": 1.0}
+
+
+PL = "constraint_0_power_limit_uw"
+PL2 = "constraint_1_power_limit_uw"
+
+
+def test_cpu_cap_capped_and_tolerance(sysfs, tmp_path):
+    write(sysfs / "class/powercap/intel-rapl:0" / PL, 45_000_000)
+    write(sysfs / "class/powercap/intel-rapl:0" / PL2, 45_000_000)
+    d = cap_dir(tmp_path, record(intel_rapl_0={PL: 45_000_000, PL2: 45_000_000}))
+    assert pw.read_cpu_cap(sysfs, d) == ("capped", 45.0)
+    write(sysfs / "class/powercap/intel-rapl:0" / PL, 45_999_000)        # RAPL unit rounding
+    assert pw.read_cpu_cap(sysfs, d) == ("capped", 45.0)
+
+
+def test_cpu_cap_w_sums_pl1_over_zones(tmp_path):
+    root = make_sysfs(tmp_path / "sys", packages=(0, 1))
+    for n, uw in ((0, 30_000_000), (1, 20_500_000)):
+        write(root / f"class/powercap/intel-rapl:{n}" / PL, uw)
+    d = cap_dir(tmp_path, record(intel_rapl_0={PL: 30_000_000}, intel_rapl_1={PL: 20_500_000}))
+    assert pw.read_cpu_cap(root, d) == ("capped", 50.5)
+
+
+@pytest.mark.parametrize("change", ["pl1", "pl2", "disabled", "zone-missing"])
+def test_cpu_cap_reverted(sysfs, tmp_path, change):
+    zone = sysfs / "class/powercap/intel-rapl:0"
+    write(zone / PL, 45_000_000)
+    write(zone / PL2, 45_000_000)
+    rec = record(intel_rapl_0={PL: 45_000_000, PL2: 45_000_000})
+    if change == "pl1":
+        write(zone / PL, 91_000_000)           # PL1 back to the firmware value (nostromo)
+    elif change == "pl2":
+        write(zone / PL2, 46_500_000)
+    elif change == "disabled":
+        write(zone / "enabled", 0)
+    else:
+        rec["zones"]["intel-rapl:7"] = {PL: 45_000_000}
+    assert pw.read_cpu_cap(sysfs, cap_dir(tmp_path, rec)) == ("reverted", 90.0
+                                                              if change == "zone-missing" else 45.0)
+
+
+def test_cpu_cap_uncapped_only_when_both_files_are_absent(sysfs, tmp_path):
+    assert pw.read_cpu_cap(sysfs, tmp_path / "missing") == ("uncapped", None)
+    assert pw.read_cpu_cap(sysfs, cap_dir(tmp_path)) == ("uncapped", None)
+
+
+def test_cpu_cap_null_for_a_cap_by_an_older_power_cap(sysfs, tmp_path):
+    """originals.json without applied.json: only an older power-cap leaves that (every `set`
+    of the current one writes a record)."""
+    assert pw.read_cpu_cap(sysfs, cap_dir(tmp_path, originals=True)) == (None, None)
+
+
+@pytest.mark.parametrize("originals", [False, True])
+def test_cpu_cap_uncapped_for_a_record_of_no_zones(sysfs, tmp_path, originals):
+    """"zones": {}: power-cap holds no CPU limit (a GPU-only set, refused CPU writes, or a
+    reset that restored the CPU but not everything else)."""
+    d = cap_dir(tmp_path, {"zones": {}, "time": 1.0}, originals=originals)
+    assert pw.read_cpu_cap(sysfs, d) == ("uncapped", None)
+
+
+@pytest.mark.parametrize("content", [
+    "{not json", "[]", "null", '{}', '{"zones": []}',
+    '{"zones": {"../../etc": {"constraint_0_power_limit_uw": 1}}}',
+    '{"zones": {"intel-rapl:0": {"constraint_0_power_limit_uw": 4.5e7}}}',
+    '{"zones": {"intel-rapl:0": {"constraint_0_power_limit_uw": false}}}',
+    '{"zones": {"intel-rapl:0": {"constraint_0_power_limit_uw": -1}}}',
+    '{"zones": {"intel-rapl:0": {"enabled": 1}}}', '{"zones": {"intel-rapl:0": {}}}',
+    "{}" + " " * (64 * 1024), b"\xff\xfe",
+])
+def test_cpu_cap_null_for_a_malformed_or_oversized_record(sysfs, tmp_path, content):
+    d = cap_dir(tmp_path)
+    if isinstance(content, bytes):
+        (d / "applied.json").write_bytes(content)
+    else:
+        (d / "applied.json").write_text(content)
+    assert pw.read_cpu_cap(sysfs, d) == (None, None)
+
+
+def test_cpu_cap_record_of_exactly_64_kib_is_read(sysfs, tmp_path):
+    write(sysfs / "class/powercap/intel-rapl:0" / PL, 45_000_000)
+    text = json.dumps(record(intel_rapl_0={PL: 45_000_000}))
+    d = cap_dir(tmp_path, text + " " * (64 * 1024 - len(text)))
+    assert (d / "applied.json").stat().st_size == 64 * 1024
+    assert pw.read_cpu_cap(sysfs, d) == ("capped", 45.0)
+
+
+def test_cpu_cap_null_for_a_non_regular_file(sysfs, tmp_path):
+    d = cap_dir(tmp_path)
+    os.mkfifo(d / "applied.json")              # a blocking open would hang the monitor
+    assert pw.read_cpu_cap(sysfs, d) == (None, None)
+    (d / "applied.json").unlink()
+    (d / "applied.json").mkdir()
+    assert pw.read_cpu_cap(sysfs, d) == (None, None)
+
+
+def test_cpu_cap_null_on_permission_errors(sysfs, tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file modes")
+    write(sysfs / "class/powercap/intel-rapl:0" / PL, 45_000_000)
+    d = cap_dir(tmp_path, record(intel_rapl_0={PL: 45_000_000}))
+    (d / "applied.json").chmod(0o000)
+    assert pw.read_cpu_cap(sysfs, d) == (None, None)
+    (d / "applied.json").unlink()
+    d.chmod(0o000)                             # a root-only 0700 dir from an older power-cap
+    try:
+        assert pw.read_cpu_cap(sysfs, d) == (None, None)
+    finally:
+        d.chmod(0o755)
+
+
+def test_cpu_cap_null_when_a_live_limit_is_unreadable(sysfs, tmp_path):
+    d = cap_dir(tmp_path, record(intel_rapl_0={PL: 45_000_000, PL2: 45_000_000}))
+    write(sysfs / "class/powercap/intel-rapl:0" / PL, 45_000_000)
+    assert pw.read_cpu_cap(sysfs, d) == (None, 45.0)          # constraint_1 file missing
+    write(sysfs / "class/powercap/intel-rapl:0" / PL2, 45_000_000)
+    (sysfs / "class/powercap/intel-rapl:0/enabled").unlink()
+    assert pw.read_cpu_cap(sysfs, d) == (None, 45.0)
+
+
+def test_cpu_cap_w_null_when_only_pl2_was_recorded(sysfs, tmp_path):
+    write(sysfs / "class/powercap/intel-rapl:0" / PL2, 45_000_000)
+    d = cap_dir(tmp_path, record(intel_rapl_0={PL2: 45_000_000}))
+    assert pw.read_cpu_cap(sysfs, d) == ("capped", None)
+
+
+def test_cpu_cap_never_raises(sysfs, tmp_path, monkeypatch):
+    def boom(*a, **kw):
+        raise RuntimeError("surprise")
+
+    d = cap_dir(tmp_path, record(intel_rapl_0={PL: 45_000_000}))
+    monkeypatch.setattr(pw, "read_int", boom)
+    assert pw.read_cpu_cap(sysfs, d) == (None, None)
+
+
+def test_cpu_cap_reads_power_cap_state_dir_each_sample(sysfs, tmp_path, monkeypatch):
+    write(sysfs / "class/powercap/intel-rapl:0" / PL, 45_000_000)
+    d = cap_dir(tmp_path)
+    monkeypatch.setenv("POWER_CAP_STATE_DIR", str(d))
+    assert pw.read_cpu_cap(sysfs) == ("uncapped", None)
+    (d / "applied.json").write_text(json.dumps(record(intel_rapl_0={PL: 45_000_000})))
+    assert pw.read_cpu_cap(sysfs) == ("capped", 45.0)
+    monkeypatch.delenv("POWER_CAP_STATE_DIR")
+    assert pw.cap_state_dir() == Path("/run/power-cap")

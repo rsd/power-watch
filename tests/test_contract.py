@@ -41,7 +41,8 @@ HISTORY_MAX_LINE_CHARS = 1024  # the plugin skips a longer history line (Model.j
 
 NUM, NUM_OR_NULL = {"number"}, {"number", "null"}
 STR_OR_NULL = {"string", "null"}
-# Every current.json key the plugin reads, with the JSON types the producer may write there.
+# Every current.json key the plugin reads, with the JSON types the producer may write there;
+# cpu_cap and cpu_cap_w were added later (a plugin that predates them ignores them).
 CURRENT_KEYS = {
     "epoch": NUM, "interval_s": NUM, "threshold_w": NUM,
     "ac_online": {"boolean", "null"}, "battery_status": STR_OR_NULL,
@@ -52,6 +53,7 @@ CURRENT_KEYS = {
     "incomplete": {"boolean"}, "total_lower_bound": {"boolean"}, "psys_w": NUM_OR_NULL,
     "adapter_v": NUM_OR_NULL, "adapter_current_a": NUM_OR_NULL, "adapter_rating_w": NUM_OR_NULL,
     "cpu_limit_w": NUM_OR_NULL, "gpu_limit_w": NUM_OR_NULL, "gpu_max_limit_w": NUM_OR_NULL,
+    "cpu_cap": STR_OR_NULL, "cpu_cap_w": NUM_OR_NULL,
     "gpu_pstate": STR_OR_NULL, "gpu_status": {"string"}, "gpu_devices": {"array"},
     "errors": {"array"},
 }
@@ -64,6 +66,8 @@ ENUMS = {
     "total_kind": {"measured", "estimated"},
     "total_source": {"battery", "psys", "model"},
     "gpu_status": {"active", "suspended", "none", "disabled", "unknown"},
+    # power-cap's CPU cap against the live limits; null = cannot tell
+    "cpu_cap": {"capped", "uncapped", "reverted", None},
 }
 GPU_DEVICE_ENUMS = {"vendor": {"nvidia", "amd"}, "status": {"active", "suspended", "unknown"}}
 PCI_RE = r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]"
@@ -112,10 +116,12 @@ def scenario(name, tmp_path, monkeypatch):
     every nullable key the plugin reads come out non-null at least once."""
     base = tmp_path / name
     env, argv, psys_w = {}, (), None
-    if name == "ac-estimated":  # dGPU, adapter configured, CPU limit readable
+    if name == "ac-estimated":  # dGPU, adapter configured, CPU limit readable and capped
         root = make_sysfs(base / "sys")
         write(root / "class/powercap/intel-rapl:0/constraint_0_power_limit_uw", 45_000_000)
         argv = ("--adapter-voltage", "19.5", "--adapter-rating", "330")
+        env = {"POWER_CAP_STATE_DIR": str(cap_state(base, {"constraint_0_power_limit_uw":
+                                                           45_000_000}))}
     elif name == "battery":
         root = make_sysfs(base / "sys", ac=0, status="Discharging", current_ua=2_000_000, gpus=())
     elif name == "psys":
@@ -132,6 +138,44 @@ def scenario(name, tmp_path, monkeypatch):
 
 
 SCENARIOS = ["ac-estimated", "battery", "psys", "gpu-unreadable"]
+
+
+def cap_state(base, entry=None, originals=False):
+    """A power-cap state dir: applied.json recording `entry` for intel-rapl:0 (an empty entry:
+    a record of no zones), originals.json."""
+    d = base / "run-power-cap"
+    d.mkdir(parents=True, exist_ok=True)
+    if entry is not None:
+        zones = {"intel-rapl:0": entry} if entry else {}
+        (d / "applied.json").write_text(json.dumps({"zones": zones, "time": BASE}))
+    if originals:
+        (d / "originals.json").write_text("{}")
+    return d
+
+
+# power-cap state (applied PL1 in uW, 0 = a record of no zones, None = no applied.json;
+# originals.json present) -> cpu_cap, cpu_cap_w
+CPU_CAP_CASES = [
+    ((45_000_000, True), ("capped", 45.0)),
+    ((30_000_000, True), ("reverted", 30.0)),   # live PL1 is 45 W: something restored it
+    ((None, False), ("uncapped", None)),
+    ((0, True), ("uncapped", None)),            # power-cap holds no CPU limit
+    ((None, True), (None, None)),               # only an older power-cap leaves this
+]
+
+
+@pytest.mark.parametrize("state, expected", CPU_CAP_CASES)
+def test_cpu_cap_is_one_of_the_pinned_values(tmp_path, monkeypatch, state, expected):
+    pl1, originals = state
+    root = make_sysfs(tmp_path / "sys")
+    write(root / "class/powercap/intel-rapl:0/constraint_0_power_limit_uw", 45_000_000)
+    entry = None if pl1 is None else {"constraint_0_power_limit_uw": pl1} if pl1 else {}
+    sdir = cap_state(tmp_path, entry, originals)
+    assert run_service(tmp_path, monkeypatch, root, ticks=2,
+                       env={"POWER_CAP_STATE_DIR": str(sdir)}) == 0
+    current = json.loads((tmp_path / "state" / CURRENT).read_text())
+    assert (current["cpu_cap"], current["cpu_cap_w"]) == expected
+    assert current["cpu_cap"] in ENUMS["cpu_cap"]
 
 
 # ----------------------------------------------------------------- files

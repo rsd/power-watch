@@ -23,14 +23,25 @@ A runtime-suspended NVIDIA GPU is never queried or capped: nvidia-smi would wake
 
 The original values are saved to $POWER_CAP_STATE_DIR/originals.json (default
 /run/power-cap, so they vanish on reboot, as do the limits) on the first `set`;
-`reset` restores them.
+`reset` restores them. originals.json is root-only (0600).
+
+applied.json in the same dir (0644; the dir is 0755) records the CPU limits power-cap holds
+in place, so `power-cap status` and the power-watch monitor, both unprivileged, can tell
+whether something else (typically thermald) restored the firmware limits since: the cap
+shows as "reverted". Every `set` writes it ("zones": {} when it holds no CPU limit); a
+partial `reset` keeps only the limits it could not restore, a complete one removes it.
+
+thermald may restore RAPL limits it manages. `set` warns when thermald.service is active;
+`set --pause-thermald` stops it (`systemctl stop`, never disable or mask) before writing,
+records that in originals.json, and `reset` starts it again. A reboot starts it too, and
+drops the cap.
 
 Limitation: the GPU part drives NVIDIA GPU 0 only (`nvidia-smi -i 0`); its sysfs
 runtime state is read from the first NVIDIA display device in PCI address order.
 
 Environment: POWER_WATCH_SYSFS (sysfs root, default /sys), POWER_WATCH_NVIDIA_SMI
-(nvidia-smi command), POWER_CAP_STATE_DIR (default /run/power-cap),
-POWER_WATCH_CONFIG (config file).
+(nvidia-smi command), POWER_CAP_SYSTEMCTL (systemctl command), POWER_CAP_STATE_DIR
+(default /run/power-cap), POWER_WATCH_CONFIG (config file).
 """
 
 import argparse
@@ -41,11 +52,13 @@ import json
 import math
 import os
 import pwd
+import re
 import shlex
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 MIN_CPU_W = 5
@@ -63,6 +76,16 @@ NVIDIA_VENDOR = "0x10de"
 SUSPENDED_STATES = ("suspended", "suspending")     # same rule as bin/power-watch
 GPU_SKIP_NO_DATA = "skipped (no NVIDIA GPU limit known; set [power-cap] safe_gpu_w or use --gpu)"
 GPU_SKIP_SUSPENDED = "skipped (NVIDIA GPU runtime-suspended; not woken to cap it)"
+THERMALD_UNIT = "thermald.service"
+SYSTEMCTL_TIMEOUT_S = 5         # is-active
+SYSTEMCTL_STOP_TIMEOUT_S = 30   # stop / start
+THERMALD_MARKER = "thermald_stopped"
+# The state dir is world-readable (0755) so the unprivileged monitor and `power-cap status`
+# can read applied.json (0644): it holds only limit values that are already world-readable in
+# sysfs. originals.json stays 0600.
+STATE_DIR_MODE = 0o755
+MAX_RECORD_BYTES = 64 * 1024
+ZONE_NAME_RE = re.compile(r"intel-rapl:\d+")
 
 # Module-level so tests can pretend to be root and record identity switches.
 geteuid, getegid = os.geteuid, os.getegid
@@ -71,7 +94,12 @@ getgroups, setgroups, getgrouplist = os.getgroups, os.setgroups, os.getgrouplist
 
 
 class NeedsRoot(Exception):
-    """A write was refused with EACCES/EPERM while not running as root."""
+    """A write was refused with EACCES/EPERM while not running as root (or an action that
+    only root may take was requested); reason ends the "needs root" message."""
+
+    def __init__(self, target, reason=None):
+        super().__init__(target)
+        self.reason = reason or f"permission denied writing {target}"
 
 
 class BadState(Exception):
@@ -92,8 +120,21 @@ def nvidia_cmd():
     return shlex.split(os.environ.get("POWER_WATCH_NVIDIA_SMI", "nvidia-smi"))
 
 
+def systemctl_cmd():
+    return shlex.split(os.environ.get("POWER_CAP_SYSTEMCTL", "systemctl"))
+
+
+def state_dir():
+    # POWER_CAP_STATE_DIR is a test hook (chmod-ed to STATE_DIR_MODE); sudo's env_reset drops it
+    return Path(os.environ.get("POWER_CAP_STATE_DIR", "/run/power-cap"))
+
+
 def originals_path():
-    return Path(os.environ.get("POWER_CAP_STATE_DIR", "/run/power-cap")) / "originals.json"
+    return state_dir() / "originals.json"
+
+
+def applied_path():
+    return state_dir() / "applied.json"
 
 
 # --- config ----------------------------------------------------------------
@@ -426,6 +467,64 @@ def apply_gpu(watts):
     return False, f"refused by hardware/driver (wrote {watts:g} W, reads back {got:g} W)"
 
 
+# --- thermald (systemctl) --------------------------------------------------
+
+def run_systemctl(args, timeout):
+    """(returncode, stdout, stderr) of systemctl + args, run as an argv list (no shell);
+    returncode None when it could not run (missing binary, timeout, OSError)."""
+    cmd = systemctl_cmd() + list(args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    except FileNotFoundError:
+        return None, "", f"command not found: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return None, "", f"timed out after {timeout} s"
+    except OSError as e:
+        return None, "", str(e)
+    return r.returncode, r.stdout, r.stderr
+
+
+def thermald_state():
+    """"active" when `systemctl is-active thermald.service` prints "active" first, "unknown"
+    when systemctl cannot run or prints nothing, else "inactive"."""
+    rc, out, _ = run_systemctl(["is-active", THERMALD_UNIT], SYSTEMCTL_TIMEOUT_S)
+    lines = out.strip().splitlines()
+    if rc is None or not lines:
+        return "unknown"
+    return "active" if lines[0].strip() == "active" else "inactive"
+
+
+def systemctl_error(rc, err):
+    first = (err.strip().splitlines() or [f"exit status {rc}"])[0]
+    return f"systemctl error: {first}"
+
+
+def stop_thermald():
+    """Stop thermald.service (never disable or mask it), then re-check; (ok, message)."""
+    rc, _, err = run_systemctl(["--no-ask-password", "stop", THERMALD_UNIT],
+                               SYSTEMCTL_STOP_TIMEOUT_S)
+    state = thermald_state()
+    if state == "inactive":
+        return True, "stopped (reset starts it again)"
+    if rc not in (None, 0):
+        return False, f"not stopped: {systemctl_error(rc, err)}"
+    if rc is None:
+        return False, f"not stopped: systemctl {err}"
+    if state == "unknown":
+        return False, "not stopped: state unknown after systemctl stop"
+    return False, "not stopped: still active after systemctl stop"
+
+
+def start_thermald():
+    rc, _, err = run_systemctl(["--no-ask-password", "start", THERMALD_UNIT],
+                               SYSTEMCTL_STOP_TIMEOUT_S)
+    if rc == 0:
+        return True, "started again"
+    if rc is None:
+        return False, f"not started: systemctl {err}"
+    return False, f"not started: {systemctl_error(rc, err)}"
+
+
 # --- originals -------------------------------------------------------------
 
 def load_originals():
@@ -445,27 +544,166 @@ def load_originals():
 
 
 def has_originals(data):
-    """True when data holds at least one value that `reset` could restore."""
+    """True when data holds at least one value that `reset` could restore, or the marker
+    that power-cap stopped thermald (reset starts it again)."""
     if not data:
         return False
     zones = data.get("zones") or {}
-    return any(zones.values()) or (data.get("gpu") or {}).get("enforced_limit_w") is not None
+    return (any(zones.values()) or (data.get("gpu") or {}).get("enforced_limit_w") is not None
+            or data.get(THERMALD_MARKER) is True)
 
 
-def save_originals(data):
-    """Atomic write, dir 0700, file 0600."""
-    path = originals_path()
+def ensure_state_dir():
+    """Create the state dir and set it to STATE_DIR_MODE (also opening a 0700 dir left by an
+    older power-cap); every `set` calls it before writing anything."""
+    path = state_dir()
     try:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(path.parent, 0o700)
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".originals.")
+        path.mkdir(mode=STATE_DIR_MODE, parents=True, exist_ok=True)
+        os.chmod(path, STATE_DIR_MODE)
+    except PermissionError as e:
+        raise NeedsRoot(str(path)) from e
+
+
+def write_state_file(path, data, mode):
+    """Atomic write of a JSON state file with the given mode; the state dir is STATE_DIR_MODE."""
+    ensure_state_dir()
+    try:
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}.")
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2, sort_keys=True)
             f.write("\n")
-        os.chmod(tmp, 0o600)
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except PermissionError as e:
         raise NeedsRoot(str(path)) from e
+
+
+def save_originals(data):
+    """Atomic write, dir 0755, file 0600."""
+    write_state_file(originals_path(), data, 0o600)
+
+
+def remove_state_file(path):
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError as e:
+        raise NeedsRoot(str(path)) from e
+
+
+# --- applied record and drift ----------------------------------------------
+
+class BadRecord(Exception):
+    """applied.json exists but is unreadable, oversized, not a regular file or malformed."""
+
+
+def valid_record(data):
+    """True for {"zones": {"intel-rapl:N": {LIMIT_KEY: int >= 0, ...}, ...}, ...}; each zone
+    entry non-empty, "zones": {} (no CPU limit held) valid."""
+    zones = data.get("zones") if isinstance(data, dict) else None
+    if not isinstance(zones, dict):
+        return False
+    for name, entry in zones.items():
+        if not (isinstance(name, str) and ZONE_NAME_RE.fullmatch(name)):
+            return False
+        if not isinstance(entry, dict) or not entry:
+            return False
+        for key, value in entry.items():
+            if (key not in LIMIT_KEYS or not isinstance(value, int) or isinstance(value, bool)
+                    or value < 0):
+                return False
+    return True
+
+
+def load_applied():
+    """The applied record, or None when there is none. Raises BadRecord."""
+    path = applied_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise BadRecord(str(e)) from e
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise BadRecord("not a regular file")
+        data = os.read(fd, MAX_RECORD_BYTES + 1)
+    except OSError as e:
+        raise BadRecord(str(e)) from e
+    finally:
+        os.close(fd)
+    if len(data) > MAX_RECORD_BYTES:
+        raise BadRecord("too large")
+    try:
+        record = json.loads(data)
+    except ValueError as e:
+        raise BadRecord(str(e)) from e
+    if not valid_record(record):
+        raise BadRecord("malformed")
+    return record
+
+
+def save_applied(zones):
+    """Write the record of the CPU limits power-cap holds in place ({zone name: {LIMIT_KEY:
+    uW}}; 0644, see STATE_DIR_MODE). Zones without a limit are left out; "zones": {} says
+    power-cap holds none (cpu_cap "uncapped"), which an absent record cannot say once
+    originals.json exists."""
+    zones = {name: dict(values) for name, values in zones.items() if values}
+    write_state_file(applied_path(), {"zones": zones, "time": time.time()}, 0o644)
+
+
+def prior_record():
+    """The applied record's zones, or None when there is none or it is unreadable."""
+    try:
+        record = load_applied()
+    except BadRecord:
+        return None
+    return None if record is None else record["zones"]
+
+
+def applied_after_set(targets, verified, disabled, prior):
+    """The zones a `set` records: each target zone's verified limits, plus the limits a
+    previous record held that this set did not replace (a refused write leaves them in
+    place), except in a zone left disabled. A GPU-only set (no targets) keeps the previous
+    record."""
+    zones = {}
+    for z, _, _ in targets:
+        if z.name in disabled:
+            continue
+        entry = dict((prior or {}).get(z.name) or {})
+        entry.update(verified.get(z.name) or {})
+        zones[z.name] = entry
+    return zones
+
+
+def cap_drift(record, base):
+    """("capped" | "reverted" | "unknown", [mismatch text]) comparing an applied record with
+    the live limits under base (sysfs class/powercap): every recorded constraint within
+    TOLERANCE_W and the zone enabled == 1 is capped; a mismatch or a missing zone is
+    reverted; an unreadable live value is unknown (bin/power-watch carries a copy of this
+    rule, read_cpu_cap; the no-record cases are in cpu_cap_line)."""
+    mismatches, unreadable = [], False
+    for name, entry in sorted(record["zones"].items()):
+        zone = base / name
+        if not zone.is_dir():
+            mismatches.append(f"{name} gone")
+            continue
+        for key in LIMIT_KEYS:
+            if key not in entry:
+                continue
+            live = read_int(zone / key)
+            if live is None:
+                unreadable = True
+            elif abs(live - entry[key]) > TOLERANCE_W * 1e6:
+                mismatches.append(f"{name} {key.split('_power')[0]} applied "
+                                  f"{entry[key] / 1e6:g} W, now {live / 1e6:g} W")
+        enabled = read_int(zone / "enabled")
+        if enabled is None:
+            unreadable = True
+        elif enabled != 1:
+            mismatches.append(f"{name} disabled")
+    if mismatches:
+        return "reverted", mismatches
+    return ("unknown" if unreadable else "capped"), []
 
 
 # --- verification ----------------------------------------------------------
@@ -629,8 +867,62 @@ def cmd_status(args):
         print(f"  draw {fmt_gpu(q['draw'])}, enforced limit {fmt_gpu(q['enforced'])}, "
               f"range {fmt_gpu(q['min'])} .. {fmt_gpu(q['max'])}, pstate {q['pstate'] or 'n/a'}")
     print(cap_state(originals_path()))
+    thermald = thermald_state()
+    print(cpu_cap_line(thermald))
+    print(thermald_line(thermald))
     print(safe_line(args.config_values, zones, state, q))
     return 0
+
+
+PAUSE_HINT = ("thermald.service is active and may restore RAPL limits; "
+              "cap again with `sudo power-cap set ... --pause-thermald`")
+
+
+OLDER_CAP_LINE = ("CPU cap: unknown (cap set by an older power-cap; "
+                  "`sudo power-cap reset` clears it)")
+
+
+def cpu_cap_line(thermald):
+    """The 'CPU cap: ...' line: the applied record compared with the live limits. Same rule as
+    bin/power-watch read_cpu_cap (current.json cpu_cap): "applied" = capped, "reverted",
+    "none" = uncapped (a record with "zones": {}, or neither applied.json nor originals.json),
+    "unknown" = null (originals.json without applied.json: a cap by an older power-cap, which
+    wrote no record; an unreadable record or live limit). Keep the two in step."""
+    try:
+        record = load_applied()
+    except BadRecord:
+        return "CPU cap: unknown (record unreadable)"
+    if record is None:
+        # os.stat, not Path.exists(): on Python 3.14 exists() is False on EACCES
+        try:
+            os.stat(originals_path())
+        except FileNotFoundError:
+            return "CPU cap: none"
+        except OSError:
+            return "CPU cap: unknown (record unreadable)"
+        return OLDER_CAP_LINE
+    if not record["zones"]:
+        return "CPU cap: none"
+    verdict, mismatches = cap_drift(record, sysfs_root() / "class" / "powercap")
+    if verdict == "capped":
+        return "CPU cap: applied, live limits match"
+    if verdict == "unknown":
+        return "CPU cap: unknown (live limits unreadable)"
+    line = "CPU cap: reverted by something else — " + "; ".join(mismatches)
+    return line + (f" ({PAUSE_HINT})" if thermald == "active" else "")
+
+
+def thermald_line(thermald):
+    if thermald == "active":
+        return "thermald: active (may restore RAPL limits; see set --pause-thermald)"
+    if thermald == "inactive":
+        try:
+            stopped = (load_originals() or {}).get(THERMALD_MARKER) is True
+        except (NeedsRoot, BadState):
+            stopped = False         # marker not readable (root-only file)
+        return ("thermald: inactive (stopped by power-cap; reset starts it again)" if stopped
+                else "thermald: inactive")
+    return "thermald: unknown"
 
 
 def cap_state(path):
@@ -699,6 +991,17 @@ def cmd_set(args):
         if not q["min"] <= gpu <= q["max"]:
             return usage_error(f"GPU limit {gpu:g} W out of range ({q['min']:g}..{q['max']:g} W)")
 
+    # thermald may restore the RAPL limits it manages: warn when a CPU cap is written with it
+    # active, or (--pause-thermald) stop it before any limit is written. A GPU-only set without
+    # the flag does not ask systemctl at all.
+    thermald = thermald_state() if want_cpu or args.pause_thermald else None
+    if args.pause_thermald and thermald == "active" and geteuid() != 0:
+        raise NeedsRoot(THERMALD_UNIT, f"stopping {THERMALD_UNIT} needs root")
+    if thermald == "active" and want_cpu and not args.pause_thermald:
+        print(f"warning: {THERMALD_UNIT} is active and may restore the RAPL limits; "
+              "add --pause-thermald to stop it until `reset`")
+
+    ensure_state_dir()      # every set: also opens a 0700 dir left by an older power-cap
     # Save what is about to change before writing anything. Existing keys are never
     # overwritten: they hold the values from before the first cap.
     created = saved is None
@@ -717,20 +1020,36 @@ def cmd_set(args):
         save_originals(data)
 
     results, wrote = [], False
+    if args.pause_thermald:
+        results.append(pause_thermald(thermald, data))
+    verified, disabled = {}, set()
     try:
         for z, pl1, pl2 in targets:
+            zone_ok = verified.setdefault(z.name, {})
             for n, w in ((0, pl1), (1, pl2)):
-                path = z / f"constraint_{n}_power_limit_uw"
-                results.append((f"{z.name} constraint_{n} {w:g} W",
-                                *write_checked(path, int(round(w * 1e6)), check_rapl)))
+                key, uw = LIMIT_KEYS[n], int(round(w * 1e6))
+                ok, msg = write_checked(z / key, uw, check_rapl)
+                results.append((f"{z.name} constraint_{n} {w:g} W", ok, msg))
                 wrote = True
+                if ok:
+                    zone_ok[key] = uw
             if read_int(z / "enabled") != 1:
-                results.append((f"{z.name} enabled",
-                                *write_checked(z / "enabled", 1, check_enabled)))
+                ok, msg = write_checked(z / "enabled", 1, check_enabled)
+                results.append((f"{z.name} enabled", ok, msg))
+                if not ok:
+                    disabled.add(z.name)    # a disabled zone enforces none of its limits
     except NeedsRoot:
         if created and not wrote:
             originals_path().unlink(missing_ok=True)
         raise
+    # Every set leaves a record: power-cap's CPU state from now on. A GPU-only set keeps an
+    # existing one, and leaves none where an older power-cap's originals hold CPU values
+    # (that cap is unknown); otherwise power-cap holds no CPU limit: "zones": {}.
+    prior = prior_record()
+    if targets:
+        save_applied(applied_after_set(targets, verified, disabled, prior))
+    elif not applied_exists() and not any(((saved or {}).get("zones") or {}).values()):
+        save_applied({})
     if gpu is not None:
         results.append((f"GPU {gpu:g} W", *apply_gpu(gpu)))
     results += skipped
@@ -738,9 +1057,26 @@ def cmd_set(args):
     return report(results)
 
 
+def pause_thermald(state, data):
+    """--pause-thermald: stop an active thermald before any limit is written and mark it in
+    originals.json so `reset` starts it again. Returns the result line."""
+    if state == "active":
+        ok, msg = stop_thermald()
+        if ok and data.get(THERMALD_MARKER) is not True:
+            data[THERMALD_MARKER] = True
+            save_originals(data)
+        return THERMALD_UNIT, ok, msg
+    if state == "unknown":
+        return THERMALD_UNIT, True, "state unknown (systemctl unavailable); nothing paused"
+    if data.get(THERMALD_MARKER) is True:
+        return THERMALD_UNIT, True, "not active, nothing to pause (stopped by power-cap earlier)"
+    return THERMALD_UNIT, True, "not active, nothing to pause"
+
+
 def cmd_reset(_args):
     data = load_originals()
     if not has_originals(data):
+        remove_state_file(applied_path())       # a stray record would claim a cap
         if data is not None:    # an empty/no-op file would keep status at "Cap: active"
             try:
                 originals_path().unlink(missing_ok=True)
@@ -749,13 +1085,18 @@ def cmd_reset(_args):
         print("nothing to reset (no saved originals)")
         return 0
     base = sysfs_root() / "class" / "powercap"
-    results = []
+    results, restored, cpu_failed = [], set(), False
     for name, entry in sorted(data.get("zones", {}).items()):
         zone = base / name
         for key in LIMIT_KEYS:          # limits first, then enabled
             if key in entry:
+                ok, msg = write_checked(zone / key, entry[key], check_rapl)
                 results.append((f"{name} {key.split('_power')[0]} {entry[key] / 1e6:g} W",
-                                *write_checked(zone / key, entry[key], check_rapl)))
+                                ok, msg))
+                if ok:
+                    restored.add((name, key))
+                else:
+                    cpu_failed = True
         if "enabled" in entry:
             results.append((f"{name} enabled {entry['enabled']}",
                             *write_checked(zone / "enabled", entry["enabled"], check_enabled)))
@@ -765,14 +1106,42 @@ def cmd_reset(_args):
                         "(not woken); run `sudo power-cap reset` again while it is in use")))
     elif w is not None:
         results.append((f"GPU {w:g} W", *apply_gpu(w)))
+    if data.get(THERMALD_MARKER) is True:      # only a thermald that power-cap stopped
+        results.append((THERMALD_UNIT, *start_thermald()))
     print("reset:")
     code = report(results)
     if code == 0:
+        remove_state_file(applied_path())
         originals_path().unlink()
         print("originals restored and cleared")
     else:
+        record_after_reset(restored, cpu_failed)
         print(f"some values were not restored; originals kept in {originals_path()}")
     return code
+
+
+def applied_exists():
+    """True unless applied.json is absent (ENOENT); os.stat, see cap_state."""
+    try:
+        os.stat(applied_path())
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def record_after_reset(restored, cpu_failed):
+    """After a partial reset, keep in the record only the CPU limits that were not restored
+    (a still-capped zone stays capped; restored ones count as uncapped). Without a readable
+    record: all CPU limits restored -> "zones": {}; a failed one -> left as is (unknown)."""
+    prior = prior_record()
+    if prior is None:
+        if not cpu_failed:
+            save_applied({})
+        return
+    save_applied({name: {key: uw for key, uw in entry.items() if (name, key) not in restored}
+                  for name, entry in prior.items()})
 
 
 def usage_error(msg):
@@ -787,13 +1156,16 @@ def build_parser():
                     "Never writes to the EC. set/reset need root (sudo).",
         epilog=f"--safe = {SAFE_HELP}: [power-cap] safe_cpu_w / safe_gpu_w in the power-watch "
                "config; `power-cap status` shows the resolved values. Limits last until "
-               "reboot or `power-cap reset`.")
+               "reboot or `power-cap reset`. thermald.service may restore the CPU limits: "
+               "`set` warns when it is active, `set --pause-thermald` stops it until `reset` "
+               "(a reboot starts it again), and `status` reports a CPU cap that was reverted.")
     p.add_argument("--config", metavar="PATH",
                    help="config file (default: $POWER_WATCH_CONFIG, the sudo/doas user's or your "
                         "~/.config/power-watch/config); only [power-cap] is read")
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("status", help="show current limits, GPU state, whether a cap is active "
-                                  "and the resolved --safe caps")
+    sub.add_parser("status", help="show current limits, GPU state, whether a cap is active, "
+                                  "whether the CPU cap still holds, thermald and the resolved "
+                                  "--safe caps")
     s = sub.add_parser(
         "set", help=f"set limits (--safe = {SAFE_HELP})",
         description=f"Set power limits. --safe = {SAFE_HELP}. "
@@ -803,7 +1175,11 @@ def build_parser():
     s.add_argument("--cpu-pl2", type=float, metavar="W", help="CPU short-term limit (PL2)")
     s.add_argument("--gpu", type=float, metavar="W", help="GPU power limit (nvidia-smi -pl)")
     s.add_argument("--safe", action="store_true", help=SAFE_HELP)
-    sub.add_parser("reset", help="restore the saved original limits")
+    s.add_argument("--pause-thermald", action="store_true",
+                   help="stop an active thermald.service before writing (it may restore the "
+                        "RAPL limits); `reset` starts it again. Never disables or masks it")
+    sub.add_parser("reset", help="restore the saved original limits (and start thermald.service "
+                                 "again if set --pause-thermald stopped it)")
     return p
 
 
@@ -821,7 +1197,7 @@ def main(argv=None):
         return handler(args)
     except NeedsRoot as e:
         print(f"power-cap: needs root: run sudo power-cap {shlex.join(argv)} "
-              f"(permission denied writing {e})", file=sys.stderr)
+              f"({e.reason})", file=sys.stderr)
         return 1
     except BadState as e:
         print(f"power-cap: error: unreadable saved originals {e}", file=sys.stderr)

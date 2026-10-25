@@ -11,7 +11,8 @@ rest-of-system term. Adapter voltage, rating and the alert threshold come from t
 (~/.config/power-watch/config) or flags; unknown values are reported as unknown, not guessed.
 
 Read-only: it never writes sysfs or the EC. It writes only the state dir, the --log file
-and stdout/stderr. A runtime-suspended discrete GPU is never queried (that would wake it).
+and stdout/stderr. It reads power-cap's applied.json ($POWER_CAP_STATE_DIR, default
+/run/power-cap) to tell whether a CPU cap still holds (current.json cpu_cap). A runtime-suspended discrete GPU is never queried (that would wake it).
 Stdlib only, Python >= 3.10.
 
 `--quiet` (the systemd user service) also records history in the state dir: current.json
@@ -30,6 +31,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -57,6 +59,9 @@ GPU_QUERY = "pci.bus_id,power.draw,enforced.power.limit,power.min_limit,power.ma
 NVIDIA_VENDOR, AMD_VENDOR, INTEL_VENDOR = "0x10de", "0x1002", "0x8086"
 CLEAR = "\x1b[H\x1b[2J"
 DEFAULT_REST_LABEL = "DEFAULT — run `power-watch calibrate`"
+# rest_source (a contract value, unchanged) -> how the live view words it; others as is
+REST_LABELS = {"default": DEFAULT_REST_LABEL, "calibrate": "calibrated",
+               "passive": "passively calibrated"}
 
 RAPL_FIX = (
     "Fix: run `sudo ./install.sh` from the power-watch repo (first time), or "
@@ -81,7 +86,8 @@ LOG_KEYS = [
     "charge_w", "total_w", "total_kind", "incomplete", "adapter_v",
     "adapter_current_a", "adapter_rating_w", "threshold_w",
 ]
-CURRENT_EXTRA_KEYS = ["interval_s", "cpu_limit_w", "gpu_max_limit_w", "epoch"]
+CURRENT_EXTRA_KEYS = ["interval_s", "cpu_limit_w", "cpu_cap", "cpu_cap_w", "gpu_max_limit_w",
+                      "epoch"]
 
 
 # ---------------------------------------------------------------- environment
@@ -92,6 +98,11 @@ def sysfs_root():
 
 def nvidia_cmd():
     return shlex.split(os.environ.get("POWER_WATCH_NVIDIA_SMI", "nvidia-smi"))
+
+
+def cap_state_dir():
+    """power-cap's state dir (applied.json, originals.json)."""
+    return Path(os.environ.get("POWER_CAP_STATE_DIR", "/run/power-cap"))
 
 
 def notify_cmd():
@@ -432,6 +443,104 @@ def read_cpu_limit(root):
     if not limits or None in limits:
         return None
     return sum(limits) / 1e6
+
+
+# power-cap's applied.json: the CPU limits power-cap holds in place (written by every `set`,
+# trimmed by a partial `reset`; "zones": {} = none), 0644 in a 0755 dir: it holds only limit
+# values that sysfs shows to everyone anyway.
+CAP_LIMIT_KEYS = ("constraint_0_power_limit_uw", "constraint_1_power_limit_uw")
+CAP_TOLERANCE_W = 1.0       # bin/power-cap TOLERANCE_W
+MAX_CAP_RECORD_BYTES = 64 * 1024
+CAP_ZONE_RE = re.compile(r"intel-rapl:\d+")
+
+
+class CapUnknown(Exception):
+    """The cap state cannot be told: cpu_cap is null."""
+
+
+def _cap_record(path):
+    """The applied record at path, or None when there is none (ENOENT). Raises CapUnknown for
+    a permission error, a non-regular or oversized file, or malformed content."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise CapUnknown(str(e)) from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise CapUnknown("not a regular file")
+        data = os.read(fd, MAX_CAP_RECORD_BYTES + 1)
+    except OSError as e:
+        raise CapUnknown(str(e)) from None
+    finally:
+        os.close(fd)
+    if len(data) > MAX_CAP_RECORD_BYTES:
+        raise CapUnknown("too large")
+    try:
+        record = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        raise CapUnknown("not JSON") from None
+    zones = record.get("zones") if isinstance(record, dict) else None
+    if not isinstance(zones, dict):     # {} is valid: power-cap holds no CPU cap
+        raise CapUnknown("malformed")
+    for name, entry in zones.items():
+        if not (isinstance(name, str) and CAP_ZONE_RE.fullmatch(name) and isinstance(entry, dict)
+                and entry and all(key in CAP_LIMIT_KEYS and type(value) is int and value >= 0
+                                  for key, value in entry.items())):
+            raise CapUnknown("malformed")
+    return zones
+
+
+def read_cpu_cap(root, sdir=None):
+    """(cpu_cap, cpu_cap_w) for current.json, from power-cap's applied.json and live sysfs.
+
+    "capped": every recorded constraint within CAP_TOLERANCE_W of the live limit and the zone
+    enabled == 1; "reverted": a mismatch, a disabled zone or a recorded zone missing;
+    "uncapped": applied.json records no zone ("zones": {}), or neither applied.json nor
+    originals.json exists (ENOENT); None (unknown): applied.json absent but originals.json
+    present (a cap by an older power-cap, which wrote no record), any other error, or a live
+    value unreadable. bin/power-cap carries a copy of this rule (cpu_cap_line, cap_drift);
+    keep the two in step. cpu_cap_w is the recorded PL1 (constraint_0) summed over zones, W,
+    or None when no record was read or it holds no PL1. Never raises: the monitor keeps
+    sampling whatever this finds."""
+    try:
+        sdir = cap_state_dir() if sdir is None else Path(sdir)
+        zones = _cap_record(sdir / "applied.json")
+        if zones is None:
+            # os.stat, not Path.exists(): on Python 3.14 exists() is False on EACCES
+            try:
+                os.stat(sdir / "originals.json")
+            except FileNotFoundError:
+                return "uncapped", None
+            return None, None
+        if not zones:
+            return "uncapped", None
+        pl1 = [entry[CAP_LIMIT_KEYS[0]] for entry in zones.values() if CAP_LIMIT_KEYS[0] in entry]
+        cap_w = sum(pl1) / 1e6 if pl1 else None
+        base = Path(root) / "class" / "powercap"
+        reverted = unreadable = False
+        for name, entry in zones.items():
+            zone = base / name
+            if not zone.is_dir():
+                reverted = True
+                continue
+            for key, value in entry.items():
+                live = read_int(zone / key)
+                if live is None:
+                    unreadable = True
+                elif abs(live - value) > CAP_TOLERANCE_W * 1e6:
+                    reverted = True
+            enabled = read_int(zone / "enabled")
+            if enabled is None:
+                unreadable = True
+            elif enabled != 1:
+                reverted = True
+        if reverted:
+            return "reverted", cap_w
+        return (None if unreadable else "capped"), cap_w
+    except Exception:       # noqa: BLE001 -- any surprise means unknown, never a stopped monitor
+        return None, None
 
 
 # -------------------------------------------------------------------- GPU
@@ -1142,7 +1251,9 @@ class Bucket:
 
 def current_report(report, s, interval, root):
     """current.json content: the --once --json report plus CURRENT_EXTRA_KEYS."""
+    cpu_cap, cpu_cap_w = read_cpu_cap(root)
     return {**report, "interval_s": float(interval), "cpu_limit_w": read_cpu_limit(root),
+            "cpu_cap": cpu_cap, "cpu_cap_w": cpu_cap_w,
             "gpu_max_limit_w": _r(s.gpu.max_limit_w), "epoch": s.epoch}
 
 
@@ -1432,7 +1543,7 @@ def render(report, monitor=None, now=None, config_path=None):
     total_source = _source(r)
     bat = f"battery {r['battery_status'] or '?'} {r['battery_capacity'] if r['battery_capacity'] is not None else '?'} %"
     source = {True: "AC online", False: "ON BATTERY", None: "AC unknown"}[r["ac_online"]]
-    rest_label = DEFAULT_REST_LABEL if r["rest_source"] == "default" else f"{r['rest_source']} calibration"
+    rest_label = REST_LABELS.get(r["rest_source"], r["rest_source"])
     lines = [
         f"Power source  {source}, {bat}",
         f"CPU package   {_w(r['cpu_w'])}",
